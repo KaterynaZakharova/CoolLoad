@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import json
 from html import escape
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-import json
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
+from scipy.stats import norm
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 
 from run_one_physical_simulation import (
     DEFAULT_SAVE_EVERY,
@@ -25,21 +32,49 @@ EXTRA_TOTAL_LOAD_MW = 5.0
 MIN_LOAD_MW = 1.0
 MAX_LOAD_MW = 150.0
 
-# Fewer global random splits and shallower refinement (faster).
+# Fewer total expensive physics evals for quick API runs; each eval = one GP observation.
 N_GLOBAL_CANDIDATES = 12
 TOP_K_REFINE = 2
 
 RANDOM_SEED = 42
 
+# GP + expected improvement (randomized search over latent z).
+BO_EI_XI = 0.03
+BO_Z_HALF_WIDTH = 3.0
+BO_EI_RANDOM_CANDIDATES = 384
+BO_GPR_ALPHA = 1e-6
+BO_INIT_MIN = 4
+
 # Fast physics during search (full run uses DEFAULT_STEPS from simulation).
 FAST_PHYSICS_STEPS = 700
 FAST_PHYSICS_SAVE_EVERY = 120
+
+# Bayes objective: per site, central ΔT vs ambient + mean-field ΔT + weighted mean absolute T.
+# ``mean_temp_C`` is O(10–40); keep weight modest so it balances °C-level deltas.
+OBJECTIVE_WEIGHT_MEAN_TEMP_C = 0.05
 
 # For optimization, keep outputs light.
 # After best load is found, you can rerun best case with save_gif=True.
 OPTIMIZATION_SAVE_GIF = False
 
 OUTPUT_ROOT = Path("load_optimization_outputs")
+
+
+def clear_load_optimization_output_dir(root: Path | None = None) -> None:
+    """Remove all previous optimization runs (HTML, PNG, GIF, JSON) under ``root``."""
+    import shutil
+
+    r = OUTPUT_ROOT if root is None else root
+    if not r.exists():
+        return
+    for child in list(r.iterdir()):
+        try:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ============================================================
@@ -50,45 +85,29 @@ def compute_single_datacenter_objective(metrics: Dict[str, Any]) -> float:
     """
     Lower is better.
 
-    This objective prioritizes:
-        - absolute max temperature
-        - central building temperature
-        - hot area above absolute thresholds
-        - existing thermal_risk_objective if available
+    Minimize thermal ΔT at the datacenter (central building vs ambient) and the
+    domain-mean anomaly, plus a term on mean absolute temperature over the grid
+    (``mean_temp_C`` from the physics run).
 
-    This is better than only using temperature anomaly because for datacenter
-    operation, absolute temperature matters.
+    The global Bayes score is the sum of this quantity over all sites.
     """
-    max_temp = float(metrics.get("max_temp_C", 0.0))
-    central_temp = float(metrics.get("central_building_temperature_C", max_temp))
-    mean_temp = float(metrics.get("mean_temp_C", max_temp))
+    central_dt = float(metrics.get("central_building_anomaly_C", 0.0))
+    mean_dt = float(metrics.get("mean_anomaly_C", 0.0))
+    mean_temp = float(metrics.get("mean_temp_C", 0.0))
 
-    hot30 = int(metrics.get("hot_area_gt_30C_cells", 0))
-    hot35 = int(metrics.get("hot_area_gt_35C_cells", 0))
-    hot40 = int(metrics.get("hot_area_gt_40C_cells", 0))
-    hot45 = int(metrics.get("hot_area_gt_45C_cells", 0))
-
-    # Use built-in thermal risk if available, but add central temp explicitly.
-    base_risk = float(metrics.get("thermal_risk_objective", max_temp))
-
-    objective = (
-        1.0 * base_risk
-        + 0.35 * central_temp
-        + 0.05 * mean_temp
-        + 0.002 * hot30
-        + 0.010 * hot35
-        + 0.030 * hot40
-        + 0.100 * hot45
+    return float(
+        central_dt
+        + mean_dt
+        + OBJECTIVE_WEIGHT_MEAN_TEMP_C * mean_temp
     )
-
-    return float(objective)
 
 
 def compute_total_objective(results: List[Dict[str, Any]]) -> float:
     """
     Total load-allocation objective.
 
-    We minimize the sum of all site risks.
+    Sum of per-site (central ΔT + mean-field ΔT + weighted mean temperature); the
+    optimizer minimizes this scalar.
     """
     total = 0.0
 
@@ -155,83 +174,101 @@ def project_loads_to_bounds(
     return np.clip(loads, min_loads, max_loads)
 
 
-def generate_candidate_loads(
-    n_datacenters: int,
+def _softmax(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float).reshape(-1)
+    x = x - float(np.max(x))
+    ex = np.exp(np.clip(x, -40.0, 40.0))
+    s = float(np.sum(ex))
+    return ex / max(s, 1e-300)
+
+
+def decode_latent_z_to_loads_mw(
+    z: np.ndarray,
     base_loads: np.ndarray,
     min_loads: np.ndarray,
     max_loads: np.ndarray,
     extra_total_load_mw: float,
-    n_candidates: int,
-    rng: np.random.Generator,
+    target_total_load: float,
 ) -> np.ndarray:
     """
-    Generate candidate load distributions.
+    Map unconstrained latent ``z`` (length n-1) to feasible MW loads.
 
-    Includes:
-        - equal split
-        - all extra load to one site
-        - random Dirichlet splits
-        - cooling-score-biased splits can be added outside if desired
+    Uses a softmax on ``n`` logits (z padded with 0) to split ``extra_total_load_mw``
+    across sites, then ``project_loads_to_bounds`` to enforce per-site min/max and total.
     """
-    target_total_load = float(base_loads.sum() + extra_total_load_mw)
+    base_loads = np.asarray(base_loads, dtype=float).reshape(-1)
+    min_loads = np.asarray(min_loads, dtype=float).reshape(-1)
+    max_loads = np.asarray(max_loads, dtype=float).reshape(-1)
+    n = int(base_loads.size)
+    extra = float(extra_total_load_mw)
 
-    candidates = []
+    if n == 1:
+        loads = np.array([target_total_load], dtype=float)
+        return project_loads_to_bounds(loads, min_loads, max_loads, target_total_load)
 
-    # Equal split.
-    equal_extra = np.ones(n_datacenters) * (extra_total_load_mw / n_datacenters)
-    candidates.append(
-        project_loads_to_bounds(
-            loads=base_loads + equal_extra,
-            min_loads=min_loads,
-            max_loads=max_loads,
-            target_total_load=target_total_load,
-        )
+    z = np.asarray(z, dtype=float).reshape(-1)
+    if z.size != n - 1:
+        raise ValueError(f"z must have length {n - 1}, got {z.size}")
+
+    logits = np.concatenate([z, np.zeros(1, dtype=float)])
+    p = _softmax(logits)
+    loads = base_loads + p * extra
+    return project_loads_to_bounds(loads, min_loads, max_loads, target_total_load)
+
+
+def expected_improvement(
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    y_best: float,
+    xi: float = BO_EI_XI,
+) -> np.ndarray:
+    """Gaussian-process expected improvement (batch)."""
+    mu = np.asarray(mu, dtype=float).reshape(-1)
+    sigma = np.maximum(np.asarray(sigma, dtype=float).reshape(-1), 1e-9)
+    imp = y_best - mu - xi
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = imp / sigma
+    ei = imp * norm.cdf(z) + sigma * norm.pdf(z)
+    return np.maximum(ei, 0.0)
+
+
+def _fit_gp(
+    X: np.ndarray,
+    y: np.ndarray,
+    random_seed: int,
+) -> GaussianProcessRegressor | None:
+    """Fit GPR on latent points; returns None if not enough data."""
+    if X.shape[0] < 2 or X.shape[1] < 1:
+        return None
+    d = X.shape[1]
+    ls = 1.0 if d == 1 else np.ones(d)
+    kernel = Matern(length_scale=ls, nu=2.5) + WhiteKernel(noise_level=1e-4)
+    gp = GaussianProcessRegressor(
+        kernel=kernel,
+        alpha=BO_GPR_ALPHA,
+        normalize_y=True,
+        random_state=random_seed,
+        n_restarts_optimizer=0,
     )
+    gp.fit(X, y)
+    return gp
 
-    # All extra load to one datacenter.
-    for i in range(n_datacenters):
-        extra = np.zeros(n_datacenters)
-        extra[i] = extra_total_load_mw
 
-        candidates.append(
-            project_loads_to_bounds(
-                loads=base_loads + extra,
-                min_loads=min_loads,
-                max_loads=max_loads,
-                target_total_load=target_total_load,
-            )
-        )
-
-    # Random load splits.
-    for _ in range(n_candidates):
-        if rng.random() < 0.5:
-            alpha = np.ones(n_datacenters) * 0.7
-        else:
-            alpha = np.ones(n_datacenters) * 2.0
-
-        extra = rng.dirichlet(alpha) * extra_total_load_mw
-
-        candidates.append(
-            project_loads_to_bounds(
-                loads=base_loads + extra,
-                min_loads=min_loads,
-                max_loads=max_loads,
-                target_total_load=target_total_load,
-            )
-        )
-
-    # Remove duplicates.
-    unique = []
-    seen = set()
-
-    for candidate in candidates:
-        key = tuple(np.round(candidate, 4))
-
-        if key not in seen:
-            seen.add(key)
-            unique.append(candidate)
-
-    return np.array(unique)
+def _suggest_next_z_ei(
+    gp: GaussianProcessRegressor,
+    y_obs: np.ndarray,
+    rng: np.random.Generator,
+    d: int,
+    n_candidates: int = BO_EI_RANDOM_CANDIDATES,
+) -> np.ndarray:
+    """Random search for z maximizing expected improvement."""
+    y_best = float(np.min(y_obs))
+    box = BO_Z_HALF_WIDTH
+    Zcand = rng.uniform(-box, box, size=(n_candidates, d))
+    mu, std = gp.predict(Zcand, return_std=True)
+    ei = expected_improvement(mu, std, y_best)
+    j = int(np.argmax(ei))
+    return Zcand[j].copy()
 
 
 # ============================================================
@@ -283,6 +320,7 @@ def run_one_dc_with_load(
     verbose: bool = False,
     fast_evaluation: bool = False,
     output_subdir: Optional[str] = None,
+    save_numpy: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Calls ``run_physical_simulation_for_params``.
@@ -311,6 +349,11 @@ def run_one_dc_with_load(
     if verbose:
         print("calling run_physical_simulation_for_params", load_mw, "MW", "fast" if fast_evaluation else "full")
 
+    if save_numpy is None:
+        save_numpy_flag = not fast_evaluation
+    else:
+        save_numpy_flag = bool(save_numpy) and not fast_evaluation
+
     result = run_physical_simulation_for_params(
         lat=float(datacenter["lat"]),
         lon=float(datacenter["lon"]),
@@ -334,7 +377,7 @@ def run_one_dc_with_load(
         return_states=False if fast_evaluation else None,
         write_disk=not fast_evaluation,
         save_plots=not fast_evaluation,
-        save_numpy=not fast_evaluation,
+        save_numpy=save_numpy_flag,
         save_metadata_json=not fast_evaluation,
         verbose=verbose,
     )
@@ -500,17 +543,27 @@ def build_per_site_bounds(
     max_cap_mw: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Per-site MW bounds consistent with the dashboard:
+    Per-site MW bounds consistent with the dashboard.
 
-    - Each site can take up to ``extra_total_load_mw`` additional MW by itself.
-    - Floors keep loads in a realistic operating band.
+    Each site's load never goes below its baseline ``base_loads_mw`` (nor below ``min_floor_mw``,
+    whichever is higher per site). Upper bounds allow any split of ``extra_total_load_mw`` across
+    sites subject to ``max_cap_mw`` (each site's max is the feasible ceiling if all others sit at
+    their minimum).
     """
-    n = len(base_loads_mw)
-    min_loads = np.maximum(min_floor_mw, base_loads_mw * 0.35)
-    max_loads = np.minimum(max_cap_mw, base_loads_mw + float(extra_total_load_mw))
+    base = np.asarray(base_loads_mw, dtype=float).reshape(-1)
+    n = int(base.size)
+    extra = float(extra_total_load_mw)
+    cap = float(max_cap_mw)
+    floor_f = float(min_floor_mw)
+
+    target_total = float(base.sum() + extra)
+    min_loads = np.maximum(base, floor_f)
+    sum_min = float(min_loads.sum())
+
+    max_loads = np.empty(n, dtype=float)
     for i in range(n):
-        if max_loads[i] < base_loads_mw[i] + 1e-9:
-            max_loads[i] = base_loads_mw[i] + float(extra_total_load_mw)
+        room = target_total - (sum_min - float(min_loads[i]))
+        max_loads[i] = min(cap, max(float(min_loads[i]), room))
     return min_loads, max_loads
 
 
@@ -574,6 +627,145 @@ def slim_refined_item(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def write_optimization_charts(
+    run_root: Path,
+    global_slim: List[Dict[str, Any]],
+    refined_slim: List[Dict[str, Any]],
+    datacenter_names: List[str],
+    base_loads_mw: List[float],
+    best_loads_mw: List[float],
+) -> Dict[str, str]:
+    """
+    Save PNG charts next to ``report.html`` for a friendlier HTML report.
+
+    Uncertainty: per-site error bars use σ(load MW) across all GP / EI evaluations,
+    not a closed-form Bayesian credible interval.
+    """
+    run_root.mkdir(parents=True, exist_ok=True)
+    paths: Dict[str, str] = {}
+
+    if not global_slim:
+        return paths
+
+    loads_mat = np.array([row["loads_mw"] for row in global_slim], dtype=float)
+    objs = np.array([row["objective"] for row in global_slim], dtype=float)
+    ranks = np.arange(1, len(objs) + 1)
+    order = np.argsort(objs)
+    objs_sorted = objs[order]
+    global_obj_std = float(np.std(objs)) if len(objs) > 1 else 0.0
+
+    fig, ax = plt.subplots(figsize=(8.5, 4.8), facecolor="#0f172a")
+    ax.set_facecolor("#0f172a")
+    ax.plot(
+        ranks,
+        objs_sorted,
+        color="#38bdf8",
+        lw=2.2,
+        marker="o",
+        ms=5,
+        label="Objective (sorted best → worst)",
+    )
+    if global_obj_std > 1e-9:
+        ax.fill_between(
+            ranks,
+            objs_sorted[0] - global_obj_std,
+            objs_sorted[0] + global_obj_std,
+            color="#38bdf8",
+            alpha=0.12,
+            label=f"Band around best ± σ_obj (σ={global_obj_std:.3f})",
+        )
+    ax.set_xlabel("Rank after sorting candidates", color="#94a3b8", fontsize=11)
+    ax.set_ylabel("Objective (lower is better)", color="#94a3b8", fontsize=11)
+    ax.tick_params(colors="#94a3b8")
+    for spine in ax.spines.values():
+        spine.set_color("#334155")
+    ax.set_title(
+        "How good were the tried load splits? (sorted curve)",
+        color="#e2e8f0",
+        fontsize=13,
+        fontweight="semibold",
+    )
+    leg = ax.legend(loc="lower right", facecolor="#1e293b", edgecolor="#334155", fontsize=9)
+    for text in leg.get_texts():
+        text.set_color("#e2e8f0")
+    fig.tight_layout()
+    p1 = run_root / "chart_objectives.png"
+    fig.savefig(p1, dpi=165, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    paths["objectives"] = p1.name
+
+    load_std = np.std(loads_mat, axis=0) if loads_mat.size else np.zeros(len(datacenter_names))
+    fig, ax = plt.subplots(figsize=(8.5, 4.8), facecolor="#0f172a")
+    ax.set_facecolor("#0f172a")
+    x_pos = np.arange(len(datacenter_names))
+    w = 0.36
+    ax.bar(
+        x_pos - w / 2,
+        base_loads_mw,
+        w,
+        label="Baseline MW",
+        color="#475569",
+        edgecolor="#64748b",
+    )
+    ax.bar(
+        x_pos + w / 2,
+        best_loads_mw,
+        w,
+        yerr=load_std,
+        capsize=5,
+        label="Optimized MW",
+        color="#22d3ee",
+        edgecolor="#0891b2",
+        ecolor="#fca5a5",
+        error_kw={"linewidth": 1.5},
+    )
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([n[:20] + ("…" if len(n) > 20 else "") for n in datacenter_names], rotation=22, ha="right", color="#94a3b8", fontsize=9)
+    ax.set_ylabel("MW", color="#94a3b8", fontsize=11)
+    ax.tick_params(colors="#94a3b8")
+    ax.set_title(
+        "Best allocation vs baseline (error bars = σ across candidate pool)",
+        color="#e2e8f0",
+        fontsize=13,
+        fontweight="semibold",
+    )
+    leg = ax.legend(facecolor="#1e293b", edgecolor="#334155")
+    for t in leg.get_texts():
+        t.set_color("#e2e8f0")
+    fig.tight_layout()
+    p2 = run_root / "chart_loads.png"
+    fig.savefig(p2, dpi=165, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    paths["loads"] = p2.name
+
+    if refined_slim:
+        fig, ax = plt.subplots(figsize=(8.5, 4.2), facecolor="#0f172a")
+        ax.set_facecolor("#0f172a")
+        labels = [f"Seed rank {int(r['initial_rank'])}" for r in refined_slim]
+        before = [float(r["initial_objective"]) for r in refined_slim]
+        after = [float(r["objective"]) for r in refined_slim]
+        x = np.arange(len(labels))
+        ax.bar(x - 0.2, before, 0.4, label="Before local refine", color="#64748b", edgecolor="#475569")
+        ax.bar(x + 0.2, after, 0.4, label="After local refine", color="#34d399", edgecolor="#059669")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, color="#94a3b8", fontsize=10)
+        ax.set_ylabel("Objective", color="#94a3b8", fontsize=11)
+        ax.tick_params(colors="#94a3b8")
+        ax.set_title("Local coordinate refinement", color="#e2e8f0", fontsize=13, fontweight="semibold")
+        leg = ax.legend(facecolor="#1e293b", edgecolor="#334155")
+        for t in leg.get_texts():
+            t.set_color("#e2e8f0")
+        for spine in ax.spines.values():
+            spine.set_color("#334155")
+        fig.tight_layout()
+        p3 = run_root / "chart_refinement.png"
+        fig.savefig(p3, dpi=165, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        paths["refinement"] = p3.name
+
+    return paths
+
+
 def build_html_report(
     *,
     run_id: str,
@@ -586,15 +778,16 @@ def build_html_report(
     best_objective: float,
     best_per_site: List[Dict[str, Any]],
     asset_rows: List[Dict[str, str]],
+    chart_paths: Dict[str, str],
 ) -> str:
-    """Self-contained HTML (relative image paths next to this file)."""
+    """HTML report with embedded charts (paths relative to ``run_root``)."""
 
     def row_cells(vals: List[str]) -> str:
         return "".join(f"<td>{escape(str(v))}</td>" for v in vals)
 
     g_head = "<tr><th>#</th><th>Objective</th><th>Loads MW</th></tr>"
     g_body = ""
-    for r in global_rows[:25]:
+    for r in global_rows[:40]:
         g_body += "<tr>"
         g_body += row_cells(
             [
@@ -605,7 +798,7 @@ def build_html_report(
         )
         g_body += "</tr>"
 
-    rf_head = "<tr><th>Rank</th><th>Obj (before)</th><th>Obj (after)</th><th>Loads MW</th></tr>"
+    rf_head = "<tr><th>Seed</th><th>Obj (before)</th><th>Obj (after)</th><th>Loads MW</th></tr>"
     rf_body = ""
     for r in refined_rows:
         rf_body += "<tr>"
@@ -638,57 +831,102 @@ def build_html_report(
         )
         best_body += "</tr>"
 
-    gallery = ""
+    def img_block(rel: str, caption: str) -> str:
+        if not rel:
+            return ""
+        u = rel.replace("\\", "/")
+        return (
+            f"<figure class='chart'><figcaption>{escape(caption)}</figcaption>"
+            f"<img src='{escape(u)}' alt='{escape(caption)}'/></figure>"
+        )
+
+    charts_html = "<div class='charts'>"
+    charts_html += "<h2>Optimization at a glance</h2>"
+    charts_html += "<p class='lead'>Curves summarize every load split we simulated during the search. "
+    charts_html += "Error bars on the allocation chart show how much each site’s MW moved across random candidates (exploration spread), not a formal Bayesian credible interval.</p>"
+    charts_html += "<div class='chart-row'>"
+    charts_html += img_block(chart_paths.get("objectives", ""), "Objective landscape (sorted)")
+    charts_html += img_block(chart_paths.get("loads", ""), "Baseline vs optimal MW")
+    charts_html += "</div>"
+    if chart_paths.get("refinement"):
+        charts_html += "<div class='chart-row'>"
+        charts_html += img_block(chart_paths["refinement"], "Local refinement")
+        charts_html += "</div>"
+    charts_html += "</div>"
+
+    gallery = "<section><h2>Physical simulation — best run</h2><p class='lead'>Heat fields from the full-resolution rerun at the optimal MW values.</p>"
     for ar in asset_rows:
         name = escape(ar["name"])
         gallery += f"<h3>{name}</h3><div class='grid'>"
         for label, rel in [
-            ("Masks", ar.get("masks", "")),
-            ("Final T", ar.get("final", "")),
+            ("City mask", ar.get("masks", "")),
+            ("Final temperature", ar.get("final", "")),
             ("Anomaly", ar.get("anomaly", "")),
         ]:
             if not rel:
                 continue
             url = rel.replace("\\", "/")
             gallery += (
-                f"<figure><figcaption>{escape(label)}</figcaption>"
-                f"<a href='{escape(url)}' target='_blank'>"
+                f"<figure class='thumb'><figcaption>{escape(label)}</figcaption>"
+                f"<a href='{escape(url)}' target='_blank' rel='noopener'>"
                 f"<img loading='lazy' src='{escape(url)}' alt='{escape(label)}'/></a></figure>"
             )
         if ar.get("gif"):
             gurl = str(ar["gif"]).replace("\\", "/")
             gallery += (
-                f"<figure><figcaption>Heat GIF</figcaption>"
+                f"<figure class='thumb'><figcaption>Heat plume GIF</figcaption>"
                 f"<img src='{escape(gurl)}' alt='gif'/></figure>"
             )
         gallery += "</div>"
+    gallery += "</section>"
 
     return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"/>
-<title>Bayes load optimization — {escape(run_id)}</title>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Thermal load optimization — {escape(run_id)}</title>
 <style>
-body {{ font-family: system-ui, sans-serif; background:#0f172a; color:#e2e8f0; margin:0; padding:24px; }}
-h1,h2,h3 {{ color:#38bdf8; }}
-table {{ border-collapse:collapse; width:100%; margin:12px 0; font-size:13px; }}
-th,td {{ border:1px solid #334155; padding:6px 8px; text-align:left; }}
-th {{ background:#1e293b; }}
-.grid {{ display:flex; flex-wrap:wrap; gap:12px; }}
-figure {{ margin:0; background:#020617; padding:8px; border-radius:8px; max-width:420px; }}
-img {{ max-width:100%; height:auto; border-radius:4px; }}
-pre {{ background:#020617; padding:12px; overflow:auto; border-radius:8px; font-size:12px; }}
+:root {{ --bg:#0b1220; --card:#111827; --line:#1f2937; --txt:#e5e7eb; --muted:#94a3b8; --accent:#38bdf8; }}
+* {{ box-sizing:border-box; }}
+body {{ font-family: ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--txt); margin:0; padding:32px 24px 48px; line-height:1.55; }}
+header {{ max-width:1100px; margin:0 auto 28px; padding:24px 28px; background:linear-gradient(135deg,#0f172a,#1e1b4b); border-radius:16px; border:1px solid var(--line); }}
+h1 {{ margin:0 0 8px; font-size:1.65rem; letter-spacing:-0.02em; color:var(--accent); }}
+.lead {{ color:var(--muted); font-size:0.95rem; margin:0 0 12px; max-width:900px; }}
+h2 {{ color:var(--accent); font-size:1.15rem; margin:28px 0 12px; border-bottom:1px solid var(--line); padding-bottom:6px; }}
+h3 {{ color:#a5f3fc; font-size:1rem; margin:18px 0 8px; }}
+table {{ border-collapse:collapse; width:100%; margin:12px 0; font-size:13px; background:var(--card); border-radius:12px; overflow:hidden; }}
+th,td {{ border:1px solid var(--line); padding:8px 10px; text-align:left; }}
+th {{ background:#1e293b; color:#cbd5e1; font-weight:600; }}
+tr:nth-child(even) td {{ background:rgba(15,23,42,0.45); }}
+.charts figure.chart {{ margin:0 0 20px; background:var(--card); padding:12px; border-radius:12px; border:1px solid var(--line); max-width:100%; }}
+.charts figure.chart img {{ width:100%; height:auto; border-radius:8px; display:block; }}
+.chart-row {{ display:grid; grid-template-columns:1fr; gap:16px; max-width:1100px; }}
+@media(min-width:900px){{ .chart-row {{ grid-template-columns:1fr 1fr; }} }}
+figure.thumb {{ margin:0; background:var(--card); padding:10px; border-radius:12px; border:1px solid var(--line); max-width:420px; }}
+figure.thumb img {{ max-width:100%; height:auto; border-radius:8px; display:block; }}
+figcaption {{ font-size:12px; color:var(--muted); margin-bottom:8px; }}
+.grid {{ display:flex; flex-wrap:wrap; gap:14px; }}
+section {{ max-width:1100px; margin:0 auto; }}
+code {{ background:#020617; padding:2px 8px; border-radius:6px; font-size:0.88em; }}
 </style></head><body>
-<h1>Load optimization report</h1>
-<p>Run <code>{escape(run_id)}</code> · extra load to place: <b>{extra_total_mw:.3f} MW</b> · best objective: <b>{best_objective:.4f}</b></p>
-<h2>Global search (top candidates shown)</h2>
+<header>
+<h1>Thermal load optimization report</h1>
+<p class="lead">This run placed <strong>{extra_total_mw:.2f} MW</strong> of extra IT load across your sites. Lower objective is better (sum over sites of central ΔT + mean ΔT vs ambient, plus weighted mean absolute temperature). Run id: <code>{escape(run_id)}</code></p>
+<p class="lead">Best objective after full physics rerun: <strong>{best_objective:.4f}</strong></p>
+</header>
+<section>
+{charts_html}
+<h2>All candidates evaluated (GP search + EI)</h2>
+<p class="lead">Every row is one simulated load split from Gaussian-process Bayesian optimization (expected improvement). The best seeds are refined locally.</p>
 <table><thead>{g_head}</thead><tbody>{g_body}</tbody></table>
-<h2>Refinement starting points</h2>
+<h2>Local refinement</h2>
 <table><thead>{rf_head}</thead><tbody>{rf_body}</tbody></table>
-<h2>Best allocation (MW)</h2>
+<h2>Best MW per site (after optimization)</h2>
 <table><thead>{best_head}</thead><tbody>{best_body}</tbody></table>
-<h2>Best-run imagery</h2>
+</section>
 {gallery}
-<h2>Optimal data JSON</h2>
-<p>See <code>optimal_data.json</code> in this folder for machine-readable results.</p>
+<section style="margin-top:32px">
+<h2>Machine-readable results</h2>
+<p class="lead">Download <code>optimal_data.json</code> from the same folder for dashboards or further analysis.</p>
+</section>
 </body></html>"""
 
 
@@ -704,7 +942,7 @@ def write_optimization_report_bundle(
     best_objective: float,
     best_results: List[Dict[str, Any]],
     final_asset_rel: List[Dict[str, str]],
-) -> Tuple[Path, Path]:
+) -> Tuple[Path, Path, Dict[str, str]]:
     run_root.mkdir(parents=True, exist_ok=True)
     names = [str(dc.get("name", f"site_{i}")) for i, dc in enumerate(datacenters)]
     best_per = slim_eval_results(best_results)
@@ -718,6 +956,16 @@ def write_optimization_report_bundle(
         "refinement": refined_slim,
         "best_per_site": best_per,
     }
+    chart_paths = write_optimization_charts(
+        run_root=run_root,
+        global_slim=global_slim,
+        refined_slim=refined_slim,
+        datacenter_names=names,
+        base_loads_mw=base_loads_mw.tolist(),
+        best_loads_mw=best_loads_mw.tolist(),
+    )
+    optimal_payload["charts"] = chart_paths
+
     json_path = run_root / "optimal_data.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(optimal_payload, f, indent=2, default=str)
@@ -733,12 +981,13 @@ def write_optimization_report_bundle(
         best_objective=float(best_objective),
         best_per_site=best_per,
         asset_rows=final_asset_rel,
+        chart_paths=chart_paths,
     )
     html_path = run_root / "report.html"
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
-    return html_path, json_path
+    return html_path, json_path, chart_paths
 
 
 # ============================================================
@@ -763,6 +1012,17 @@ def optimize_datacenter_loads_iter(
     Yields progress/log dicts, then a final ``{"type": "complete", "result": ...}``.
 
     All loads are in **MW** (IT load into the physics wrapper).
+
+    Search strategy:
+        1. **Initial design**: latent vectors ``z ∈ R^{n-1}`` (softmax → extra-MW split),
+           including an equal-split anchor and uniform random points.
+        2. **Bayesian optimization**: ``sklearn.gaussian_process.GaussianProcessRegressor``
+           (Matern kernel) on ``(z, objective)``, then **expected improvement** maximized
+           by random search over ``z`` (``BO_EI_RANDOM_CANDIDATES`` proposals per step).
+        3. **Local polish**: existing coordinate-wise load moves on the top-``k`` GP points.
+
+    ``n_global_candidates`` is the total number of expensive physics evaluations in stage
+    (1)+(2) before refinement.
     """
     if len(datacenters) == 0:
         raise ValueError("datacenters list is empty.")
@@ -791,50 +1051,92 @@ def optimize_datacenter_loads_iter(
 
     cache = SimulationCache(load_round_digits=3)
 
-    candidates = generate_candidate_loads(
-        n_datacenters=n,
-        base_loads=base_loads,
-        min_loads=min_loads,
-        max_loads=max_loads,
-        extra_total_load_mw=extra_total_load_mw,
-        n_candidates=n_global_candidates,
-        rng=rng,
-    )
+    d_latent = max(0, n - 1)
+    n_budget = max(int(n_global_candidates), max(BO_INIT_MIN, 2))
 
-    n_cand = len(candidates)
+    if d_latent == 0:
+        n_init = 1
+        n_bo = 0
+        n_budget = 1
+    else:
+        n_init = min(max(BO_INIT_MIN, n + 1), max(1, n_budget // 2))
+        n_init = min(n_init, max(1, n_budget - 1))
+        n_bo = max(0, n_budget - n_init)
+
+    n_total_eval = n_init + n_bo
+
     if extra_total_load_mw > 0:
         step_sizes = [extra_total_load_mw / 4.0, extra_total_load_mw / 10.0]
     else:
         step_sizes = [0.25, 0.1]
 
     refine_ops_est = top_k_refine * len(step_sizes) * max(1, n * (n - 1))
-    total_steps_est = n_cand + refine_ops_est
+    total_steps_est = n_total_eval + refine_ops_est
 
     yield {
         "type": "plan",
         "run_id": run_id,
         "phase": "init",
-        "message": f"Bayes search: {n} sites, {n_cand} load candidates, refine top-{top_k_refine}.",
-        "candidate_count": n_cand,
+        "message": (
+            f"GP Bayesian optimization: {n} sites, {n_total_eval} physics evals "
+            f"({n_init} initial + {n_bo} EI), refine top-{top_k_refine}."
+        ),
+        "candidate_count": n_total_eval,
         "target_total_mw": target_total_load,
         "steps_total_estimate": int(total_steps_est),
     }
 
     global_history: List[Dict[str, Any]] = []
+    X_rows: List[np.ndarray] = []
+    y_list: List[float] = []
+
+    init_z: List[np.ndarray] = []
+    if d_latent == 0:
+        init_z.append(np.zeros(0, dtype=float))
+    else:
+        init_z.append(np.zeros(d_latent, dtype=float))
+        while len(init_z) < n_init:
+            init_z.append(
+                rng.uniform(-BO_Z_HALF_WIDTH, BO_Z_HALF_WIDTH, size=d_latent).astype(float)
+            )
+        init_z = init_z[:n_init]
 
     if verbose:
-        print(f"\nGLOBAL LOAD SEARCH — {n_cand} candidates, target {target_total_load:.3f} MW total")
+        print(
+            f"\nGP BAYESIAN OPT — {n_total_eval} evals (init {n_init}, EI {n_bo}), "
+            f"target {target_total_load:.3f} MW total, latent dim {d_latent}"
+        )
 
-    for idx, loads in enumerate(candidates):
+    for idx in range(n_total_eval):
         steps_left = int(total_steps_est - idx)
         yield {
             "type": "progress",
             "phase": "global",
             "index": idx + 1,
-            "total": n_cand,
+            "total": n_total_eval,
             "steps_remaining": max(0, steps_left),
-            "message": f"Evaluating global candidate {idx + 1}/{n_cand}…",
+            "message": f"Evaluating BO point {idx + 1}/{n_total_eval}…",
         }
+
+        if idx < n_init:
+            z = init_z[idx].copy()
+        elif d_latent == 0:
+            z = np.zeros(0, dtype=float)
+        else:
+            gp = _fit_gp(np.vstack(X_rows), np.array(y_list, dtype=float), random_seed)
+            if gp is not None:
+                z = _suggest_next_z_ei(gp, np.array(y_list, dtype=float), rng, d_latent)
+            else:
+                z = rng.uniform(-BO_Z_HALF_WIDTH, BO_Z_HALF_WIDTH, size=d_latent)
+
+        loads = decode_latent_z_to_loads_mw(
+            z,
+            base_loads=base_loads,
+            min_loads=min_loads,
+            max_loads=max_loads,
+            extra_total_load_mw=extra_total_load_mw,
+            target_total_load=target_total_load,
+        )
 
         obj, results = evaluate_load_distribution(
             datacenters=datacenters,
@@ -846,16 +1148,21 @@ def optimize_datacenter_loads_iter(
             fast_evaluation=True,
         )
 
-        item = {
+        if d_latent > 0:
+            X_rows.append(z.astype(float).copy())
+        y_list.append(float(obj))
+
+        item: Dict[str, Any] = {
             "candidate_index": idx,
             "loads_mw": loads.copy(),
-            "objective": obj,
+            "objective": float(obj),
             "results": results,
         }
         global_history.append(item)
 
+        phase = "init" if idx < n_init else "ei"
         msg = (
-            f"Candidate {idx + 1}/{n_cand}: objective={obj:.4f} · loads MW="
+            f"BO [{phase}] {idx + 1}/{n_total_eval}: objective={obj:.4f} · loads MW="
             f"{np.round(loads, 3).tolist()}"
         )
         if verbose:
@@ -868,7 +1175,10 @@ def optimize_datacenter_loads_iter(
     yield {
         "type": "log",
         "phase": "global",
-        "message": f"Global stage done. Best obj so far: {global_history[0]['objective']:.4f}. Starting refinement…",
+        "message": (
+            f"GP search done. Best obj so far: {global_history[0]['objective']:.4f}. "
+            f"Starting local coordinate refinement…"
+        ),
     }
 
     refined_history: List[Dict[str, Any]] = []
@@ -881,7 +1191,7 @@ def optimize_datacenter_loads_iter(
             "index": rank + 1,
             "total": len(top_candidates),
             "steps_remaining": int(refine_ops_est - refine_step_counter),
-            "message": f"Refining from global rank {rank + 1}/{len(top_candidates)} (obj={item['objective']:.4f})…",
+            "message": f"Refining from GP rank {rank + 1}/{len(top_candidates)} (obj={item['objective']:.4f})…",
         }
 
         refined_loads, refined_obj, refined_results = coordinate_refine_loads(
@@ -937,6 +1247,10 @@ def optimize_datacenter_loads_iter(
         "target_total_mw": target_total_load,
         "base_loads_mw": base_loads,
         "extra_total_load_mw": float(extra_total_load_mw),
+        "optimization_method": "sklearn_gaussian_process_expected_improvement",
+        "bo_init_evals": int(n_init),
+        "bo_ei_evals": int(n_bo),
+        "bo_latent_dim": int(d_latent),
     }
 
     yield {"type": "complete", "result": result}
@@ -1013,6 +1327,7 @@ def rerun_best_with_full_outputs(
             verbose=verbose,
             fast_evaluation=False,
             output_subdir=output_subdir,
+            save_numpy=False,
         )
         final_results.append(result)
 

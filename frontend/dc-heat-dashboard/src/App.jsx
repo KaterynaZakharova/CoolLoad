@@ -11,7 +11,7 @@ import {
   Zap,
   Trash2,
   Play,
-  RotateCcw,
+  Loader2,
   Activity,
   Globe2,
   FileText,
@@ -424,59 +424,6 @@ function SiteImage({ src, label }) {
   );
 }
 
-function HeatPreview({ risk = "Low" }) {
-  const intensity = risk === "High" ? 1 : risk === "Medium" ? 0.68 : 0.42;
-
-  return (
-    <div className="relative h-36 overflow-hidden rounded-2xl border border-white/10 bg-slate-950">
-      <div
-        className="absolute inset-0 opacity-50"
-        style={{
-          backgroundImage:
-            "radial-gradient(circle at 20% 30%, rgba(59,130,246,.25), transparent 18%), radial-gradient(circle at 80% 70%, rgba(15,23,42,.8), transparent 30%)",
-        }}
-      />
-
-      <div className="absolute left-[18%] top-[56%] h-5 w-36 rounded bg-slate-700/70" />
-      <div className="absolute left-[50%] top-[28%] h-32 w-5 rounded bg-slate-700/70" />
-      <div className="absolute left-[34%] top-[38%] h-14 w-20 rounded-md bg-slate-600 shadow-lg shadow-black/30" />
-      <div className="absolute left-[39%] top-[45%] h-7 w-7 rounded-full bg-orange-300" />
-
-      <div
-        className="absolute left-[40%] top-[45%] h-8 w-8 rounded-full"
-        style={{
-          background: `rgba(251,146,60,${0.45 + intensity * 0.35})`,
-          boxShadow: `0 0 ${34 + intensity * 55}px ${
-            16 + intensity * 28
-          }px rgba(249,115,22,${0.22 + intensity * 0.2})`,
-        }}
-      />
-
-      <motion.div
-        className="absolute left-[44%] top-[44%] h-12 w-52 rounded-full blur-xl"
-        style={{
-          background: `rgba(248,113,113,${0.18 + intensity * 0.24})`,
-        }}
-        animate={{
-          x: [0, 34, 12],
-          scaleX: [1, 1.32, 1.08],
-          scaleY: [0.9, 1.15, 1],
-          opacity: [0.55, 0.85, 0.6],
-        }}
-        transition={{ duration: 2.8, repeat: Infinity }}
-      />
-
-      <div className="absolute bottom-3 left-3 text-xs text-slate-300">
-        Heat-transfer placeholder
-      </div>
-
-      <div className="absolute bottom-3 right-3 rounded-full bg-white/10 px-2 py-1 text-[10px] text-white">
-        {risk} risk
-      </div>
-    </div>
-  );
-}
-
 function LoadBar({ label, value, max, tone = "cyan" }) {
   const pct = clamp((Number(value || 0) / Math.max(max, 1)) * 100, 0, 100);
   const color =
@@ -543,7 +490,7 @@ function DataCenterFrame({
       <SiteImage src={center.image} label="Data center placeholder" />
 
       {center.simulation?.assets?.final && !center.simulation?.error && (
-        <div className="mt-3 overflow-hidden rounded-2xl border border-cyan-400/25 bg-black/40">
+        <div className="mt-3 overflow-hidden rounded-2xl border border-cyan-400/30 bg-black/40 shadow-lg shadow-cyan-950/20">
           <img
             src={center.simulation.assets.final}
             alt="Final temperature field"
@@ -797,10 +744,6 @@ function SelectedCenterPanel({ center, onClose }) {
           />
         </div>
 
-        <div className="mt-4">
-          <HeatPreview risk={center.simulation?.risk || "Low"} />
-        </div>
-
         {center.simulation?.error && (
           <div className="mt-4 rounded-2xl border border-red-400/30 bg-red-500/10 p-4 text-xs text-red-100">
             <div className="mb-2 font-semibold text-red-200">Simulation error</div>
@@ -856,7 +799,7 @@ function SelectedCenterPanel({ center, onClose }) {
                 <img
                   src={center.simulation.assets.gif}
                   alt="Heat plume animation"
-                  className="w-full rounded-xl border border-white/10"
+                  className="w-full rounded-xl border border-white/10 shadow-lg shadow-black/40"
                 />
               </div>
             ) : (
@@ -939,6 +882,8 @@ function LoadControlPanel({
   hasDirtyCenters,
   newLoad,
   setNewLoad,
+  bayesianLoops,
+  setBayesianLoops,
   isRunning,
   centersLength,
   runSimulation,
@@ -1067,6 +1012,27 @@ function LoadControlPanel({
           />
         </div>
 
+        <div className="mt-4 rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+          <div className="mb-2 flex items-center justify-between text-sm">
+            <span className="font-medium text-slate-200">
+              Bayesian candidate runs
+            </span>
+            <span className="font-mono font-bold text-cyan-200">{bayesianLoops}</span>
+          </div>
+          <input
+            type="range"
+            min={4}
+            max={48}
+            value={bayesianLoops}
+            onChange={(e) => setBayesianLoops(Number(e.target.value))}
+            className="w-full accent-cyan-400"
+          />
+          <p className="mt-2 text-[11px] leading-snug text-slate-500">
+            Number of global load splits evaluated before picking seeds for local
+            refinement. Higher is slower but explores more combinations.
+          </p>
+        </div>
+
         <div className="mt-4 grid grid-cols-1 gap-3">
           <Button
             className="rounded-2xl bg-orange-400 text-slate-950 hover:bg-orange-300"
@@ -1074,7 +1040,7 @@ function LoadControlPanel({
             disabled={isRunning || !centersLength}
           >
             {isRunning ? (
-              <RotateCcw className="mr-2 h-4 w-4 animate-spin" />
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
             ) : (
               <Play className="mr-2 h-4 w-4" />
             )}
@@ -1147,154 +1113,261 @@ function LoadControlPanel({
   );
 }
 
-function ReportModal({ report, onClose }) {
+function ReportModal({ report, onClose, apiBase = "" }) {
+  const opt = report.optimization || {};
+  const chartUrls = opt.chartUrls || opt.chart_urls || {};
+  const chartSrc = (key) =>
+    chartUrls[key] ? `${apiBase}${chartUrls[key]}` : null;
+  const runId = opt.runId || opt.run_id;
+
   return (
-    <AnimatePresence>
-      {report && (
-        <motion.div
-          className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/70 p-5 backdrop-blur"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-        >
-          <motion.div
-            className="max-h-[88vh] w-full max-w-5xl overflow-hidden rounded-3xl border border-white/10 bg-slate-950 shadow-2xl"
-            initial={{ y: 30, opacity: 0, scale: 0.98 }}
-            animate={{ y: 0, opacity: 1, scale: 1 }}
-            exit={{ y: 30, opacity: 0, scale: 0.98 }}
-          >
-            <div className="flex items-center justify-between border-b border-white/10 p-5">
-              <div>
-                <div className="flex items-center gap-2 text-xl font-bold text-white">
-                  <BarChart3 className="h-5 w-5 text-cyan-300" />
-                  Simulation Report
-                </div>
-                <div className="mt-1 text-xs text-slate-500">
-                  Generated at {report.generatedAt}
-                </div>
-              </div>
+    <motion.div
+      role="presentation"
+      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/75 p-4 backdrop-blur-md"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <motion.div
+        role="dialog"
+        aria-modal="true"
+        className="max-h-[90vh] w-full max-w-5xl overflow-hidden rounded-3xl border border-white/10 bg-slate-950 shadow-2xl shadow-black/50"
+        initial={{ y: 24, opacity: 0, scale: 0.98 }}
+        animate={{ y: 0, opacity: 1, scale: 1 }}
+        exit={{ y: 24, opacity: 0, scale: 0.98 }}
+        transition={{ type: "spring", damping: 28, stiffness: 320 }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+          <div>
+            <div className="flex items-center gap-2 text-xl font-bold text-white">
+              <BarChart3 className="h-5 w-5 text-cyan-300" />
+              Simulation report
+            </div>
+            <div className="mt-1 text-xs text-slate-500">
+              {report.generatedAt}
+            </div>
+          </div>
 
-              <div className="flex gap-2">
-                <Button
-                  variant="outline"
-                  onClick={() =>
-                    downloadJson("thermal_load_report.json", report)
-                  }
-                >
-                  <Download className="mr-2 h-4 w-4" />
-                  Download JSON
-                </Button>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => downloadJson("thermal_load_report.json", report)}
+            >
+              <Download className="mr-2 h-4 w-4" />
+              JSON
+            </Button>
+            <Button type="button" variant="ghost" onClick={onClose}>
+              <X className="mr-2 h-4 w-4" />
+              Close
+            </Button>
+          </div>
+        </div>
 
-                <Button size="icon" variant="ghost" onClick={onClose}>
-                  <X className="h-4 w-4" />
-                </Button>
+        <div className="max-h-[calc(90vh-5rem)] overflow-y-auto p-5">
+          <div className="mb-6 grid grid-cols-1 gap-3 md:grid-cols-3">
+            <Metric
+              icon={Zap}
+              label="New load to place"
+              value={report.newLoadToRedistributeMW}
+              unit="MW"
+            />
+            <Metric
+              icon={Cpu}
+              label="Total base"
+              value={report.totalBaseLoadMW}
+              unit="MW"
+            />
+            <Metric
+              icon={Activity}
+              label="Total optimal"
+              value={report.totalOptimalLoadMW}
+              unit="MW"
+            />
+          </div>
+
+          {runId && (
+            <div className="mb-8 rounded-2xl border border-cyan-500/20 bg-cyan-500/5 p-5">
+              <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-cyan-200">
+                Optimization run
+              </h3>
+              <p className="mb-4 text-xs text-slate-400">
+                Run <span className="font-mono text-cyan-300">{runId}</span>
+                {(opt.bayesianLoopCount ?? opt.bayesian_loop_count) != null && (
+                  <>
+                    {" "}
+                    · {opt.bayesianLoopCount ?? opt.bayesian_loop_count} global
+                    candidates
+                  </>
+                )}
+                {(opt.topKRefine ?? opt.top_k_refine) != null && (
+                  <> · top {opt.topKRefine ?? opt.top_k_refine} refined</>
+                )}
+                {opt.bestObjective != null && (
+                  <>
+                    {" "}
+                    · best objective (full physics){" "}
+                    <span className="text-white">
+                      {Number(opt.bestObjective ?? opt.best_objective).toFixed(4)}
+                    </span>
+                  </>
+                )}
+              </p>
+              <div className="grid gap-4 md:grid-cols-2">
+                {chartSrc("objectives") && (
+                  <div className="overflow-hidden rounded-xl border border-white/10 bg-black/30">
+                    <div className="px-3 py-2 text-[11px] font-medium text-slate-400">
+                      Objectives tried (sorted)
+                    </div>
+                    <img
+                      src={chartSrc("objectives")}
+                      alt="Objective curve"
+                      className="w-full"
+                    />
+                  </div>
+                )}
+                {chartSrc("loads") && (
+                  <div className="overflow-hidden rounded-xl border border-white/10 bg-black/30">
+                    <div className="px-3 py-2 text-[11px] font-medium text-slate-400">
+                      MW allocation (bars ± σ across candidates)
+                    </div>
+                    <img
+                      src={chartSrc("loads")}
+                      alt="Load allocation"
+                      className="w-full"
+                    />
+                  </div>
+                )}
+                {chartSrc("refinement") && (
+                  <div className="overflow-hidden rounded-xl border border-white/10 bg-black/30 md:col-span-2">
+                    <div className="px-3 py-2 text-[11px] font-medium text-slate-400">
+                      Local refinement
+                    </div>
+                    <img
+                      src={chartSrc("refinement")}
+                      alt="Refinement"
+                      className="max-h-80 w-full object-contain"
+                    />
+                  </div>
+                )}
               </div>
             </div>
+          )}
 
-            <div className="max-h-[72vh] overflow-auto p-5">
-              <div className="mb-5 grid grid-cols-1 gap-3 md:grid-cols-3">
-                <Metric
-                  icon={Zap}
-                  label="New load"
-                  value={report.newLoadToRedistributeMW}
-                  unit="MW"
-                />
-                <Metric
-                  icon={Cpu}
-                  label="Total base"
-                  value={report.totalBaseLoadMW}
-                  unit="MW"
-                />
-                <Metric
-                  icon={Activity}
-                  label="Total optimal"
-                  value={report.totalOptimalLoadMW}
-                  unit="MW"
-                />
-              </div>
-
-              <div className="space-y-3">
-                {report.centers.map((center) => (
-                  <div
-                    key={center.id}
-                    className="rounded-2xl border border-white/10 bg-white/[0.04] p-4"
-                  >
-                    <div className="mb-3 flex items-start justify-between">
-                      <div>
-                        <div className="font-semibold text-white">
-                          {center.name}
-                        </div>
-                        <div className="text-xs text-slate-500">
-                          {center.location.lat.toFixed(3)},{" "}
-                          {center.location.lon.toFixed(3)}
-                        </div>
-                      </div>
-
-                      <div
-                        className={`rounded-full px-3 py-1 text-xs ${
-                          center.simulation?.risk === "High"
-                            ? "bg-red-500/15 text-red-200"
-                            : center.simulation?.risk === "Medium"
-                            ? "bg-orange-500/15 text-orange-200"
-                            : "bg-emerald-500/15 text-emerald-200"
-                        }`}
-                      >
-                        {center.simulation?.risk || "Not run"}
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2 text-xs md:grid-cols-5">
-                      <div className="rounded-xl bg-black/20 p-2">
-                        <div className="text-slate-500">Base</div>
-                        <div className="font-bold text-white">
-                          {center.baseLoadMW} MW
-                        </div>
-                      </div>
-
-                      <div className="rounded-xl bg-black/20 p-2">
-                        <div className="text-slate-500">Optimal</div>
-                        <div className="font-bold text-orange-200">
-                          {center.optimalLoadMW} MW
-                        </div>
-                      </div>
-
-                      <div className="rounded-xl bg-black/20 p-2">
-                        <div className="text-slate-500">ΔT</div>
-                        <div className="font-bold text-white">
-                          {center.simulation?.deltaT ?? "—"} °C
-                        </div>
-                      </div>
-
-                      <div className="rounded-xl bg-black/20 p-2">
-                        <div className="text-slate-500">Max temp</div>
-                        <div className="font-bold text-white">
-                          {center.simulation?.maxTemp ?? "—"} °C
-                        </div>
-                      </div>
-
-                      <div className="rounded-xl bg-black/20 p-2">
-                        <div className="text-slate-500">Extra</div>
-                        <div className="font-bold text-cyan-200">
-                          {center.simulation?.assignedExtra ?? "—"} MW
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="mt-3 text-xs text-slate-400">
-                      {center.simulation?.status || "No simulation result"}
+          <h3 className="mb-3 text-sm font-semibold text-slate-300">Sites</h3>
+          <div className="space-y-4">
+            {report.centers.map((center) => (
+              <div
+                key={center.id}
+                className="rounded-2xl border border-white/10 bg-white/[0.04] p-4"
+              >
+                <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <div className="font-semibold text-white">{center.name}</div>
+                    <div className="text-xs text-slate-500">
+                      {center.location.lat.toFixed(3)},{" "}
+                      {center.location.lon.toFixed(3)}
                     </div>
                   </div>
-                ))}
-              </div>
+                  <div
+                    className={`rounded-full px-3 py-1 text-xs ${
+                      center.simulation?.risk === "High"
+                        ? "bg-red-500/15 text-red-200"
+                        : center.simulation?.risk === "Medium"
+                        ? "bg-orange-500/15 text-orange-200"
+                        : "bg-emerald-500/15 text-emerald-200"
+                    }`}
+                  >
+                    {center.simulation?.risk || "Not run"}
+                  </div>
+                </div>
 
-              <pre className="mt-5 overflow-auto rounded-2xl border border-white/10 bg-black/40 p-4 text-xs text-slate-300">
-                {JSON.stringify(report, null, 2)}
-              </pre>
-            </div>
-          </motion.div>
-        </motion.div>
-      )}
-    </AnimatePresence>
+                <div className="grid grid-cols-2 gap-2 text-xs md:grid-cols-5">
+                  <div className="rounded-xl bg-black/25 p-2">
+                    <div className="text-slate-500">Base</div>
+                    <div className="font-bold text-white">{center.baseLoadMW} MW</div>
+                  </div>
+                  <div className="rounded-xl bg-black/25 p-2">
+                    <div className="text-slate-500">Optimal</div>
+                    <div className="font-bold text-orange-200">
+                      {center.optimalLoadMW} MW
+                    </div>
+                  </div>
+                  <div className="rounded-xl bg-black/25 p-2">
+                    <div className="text-slate-500">ΔT</div>
+                    <div className="font-bold text-white">
+                      {center.simulation?.deltaT ?? "—"} °C
+                    </div>
+                  </div>
+                  <div className="rounded-xl bg-black/25 p-2">
+                    <div className="text-slate-500">Max temp</div>
+                    <div className="font-bold text-white">
+                      {center.simulation?.maxTemp ?? "—"} °C
+                    </div>
+                  </div>
+                  <div className="rounded-xl bg-black/25 p-2">
+                    <div className="text-slate-500">Extra</div>
+                    <div className="font-bold text-cyan-200">
+                      {center.simulation?.assignedExtra ?? "—"} MW
+                    </div>
+                  </div>
+                </div>
+
+                {center.simulation?.assets && !center.simulation?.error && (
+                  <div className="mt-4 grid grid-cols-2 gap-2 md:grid-cols-4">
+                    {["masks", "final", "anomaly"].map((k) => {
+                      const u = center.simulation.assets[k];
+                      if (!u) return null;
+                      const src = u.startsWith("http") ? u : `${apiBase}${u}`;
+                      return (
+                        <a
+                          key={k}
+                          href={src}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="block overflow-hidden rounded-xl border border-white/10 bg-black/40"
+                        >
+                          <img
+                            src={src}
+                            alt={k}
+                            className="h-24 w-full object-cover"
+                          />
+                          <div className="px-2 py-1 text-[10px] capitalize text-slate-400">
+                            {k === "final" ? "Final T" : k}
+                          </div>
+                        </a>
+                      );
+                    })}
+                    {center.simulation.assets.gif && (
+                      <div className="col-span-2 overflow-hidden rounded-xl border border-white/10 bg-black/40 md:col-span-4">
+                        <div className="px-2 py-1 text-[10px] text-slate-400">Heat GIF</div>
+                        <img
+                          src={
+                            center.simulation.assets.gif.startsWith("http")
+                              ? center.simulation.assets.gif
+                              : `${apiBase}${center.simulation.assets.gif}`
+                          }
+                          alt="gif"
+                          className="max-h-48 w-full object-contain"
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="mt-2 text-xs text-slate-500">
+                  {center.simulation?.status || "—"}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </motion.div>
+    </motion.div>
   );
 }
 
@@ -1314,6 +1387,7 @@ export default function App() {
   const [bayesEvents, setBayesEvents] = useState([]);
   const [optimizationProgress, setOptimizationProgress] = useState(null);
   const [lastOptimizationBundle, setLastOptimizationBundle] = useState(null);
+  const [bayesianLoops, setBayesianLoops] = useState(12);
 
   const selectedCenter = centers.find((c) => c.id === selectedId) || null;
 
@@ -1480,6 +1554,8 @@ export default function App() {
           body: JSON.stringify({
             sites: sitesPayload,
             extra_total_load_mw: Number(newLoad),
+            bayesian_loop_count: Math.min(80, Math.max(4, Number(bayesianLoops) || 12)),
+            top_k_refine: 2,
           }),
           signal: controller.signal,
         });
@@ -1575,12 +1651,15 @@ export default function App() {
       setLastOptimizationBundle(bundle);
 
       const optMeta = {
-        runId,
+        runId: completeData.run_id,
         bestObjective: completeData.best_objective,
         reportHtmlUrl: completeData.report_html_url,
         optimalJsonUrl: completeData.optimal_json_url,
+        chartUrls: completeData.chart_urls || {},
         globalSearch: completeData.global_slim,
         refinement: completeData.refined_slim,
+        bayesianLoopCount: completeData.bayesian_loop_count,
+        topKRefine: completeData.top_k_refine,
       };
 
       const generated = generateReport(updated, newLoad, optMeta);
@@ -1680,6 +1759,8 @@ export default function App() {
               hasDirtyCenters={hasDirtyCenters}
               newLoad={newLoad}
               setNewLoad={setNewLoad}
+              bayesianLoops={bayesianLoops}
+              setBayesianLoops={setBayesianLoops}
               isRunning={isRunning}
               centersLength={centers.length}
               runSimulation={runSimulation}
@@ -1753,9 +1834,16 @@ export default function App() {
         </section>
       </div>
 
-      {showReport && report && (
-        <ReportModal report={report} onClose={() => setShowReport(false)} />
-      )}
+      <AnimatePresence>
+        {showReport && report && (
+          <ReportModal
+            key="thermal-report"
+            report={report}
+            apiBase={SIM_API_BASE}
+            onClose={() => setShowReport(false)}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }

@@ -11,14 +11,14 @@ Main behavior:
     - no checkerboard instability
     - no periodic np.roll diffusion artifacts
 
-Weather/load logic:
-    - Same IT load in cold and warm air.
-    - Colder air dissipates heat better.
-    - Warmer air dissipates heat worse.
-    - Warmer air slightly increases cooling overhead.
-    - Therefore, with the same load:
-        16C ambient -> smaller final delta above ambient
-        26C ambient -> larger final delta above ambient
+Weather / facility heat for the urban PDE:
+    - IT heat is linear in ``load_mw`` (MW).
+    - Chiller COP from a Carnot-style estimate vs outdoor temperature.
+    - PUE = 1 + 1/COP + electrical + fan/pump overhead fractions.
+    - Rejected facility heat ``Q_rejected_to_outdoor_MW ≈ load_mw * PUE`` drives the central-building
+      source (W/m²), plus a small explicit roof solar coupling term.
+    - Field-scale convection/radiation/diffusion still use the city PDE; envelope-style MW terms
+      are reported for interpretability (passive balance), not double-applied in the grid.
 
 Required:
 
@@ -39,7 +39,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -94,10 +94,8 @@ SOURCE_BUILDING_WIND_REDUCTION = 0.05
 CENTRAL_BUILDING_SOLAR_ABSORPTION = 0.55
 CENTRAL_SOLAR_TO_HEAT_FRACTION = 0.012
 
-LOAD_GAMMA = 1.65
-
-# Moderate source multiplier for visible plume.
-SOURCE_HEAT_MULTIPLIER = 2.2
+# Optional calibration on W/m² source derived from ``Q_rejected_to_outdoor_MW``.
+SOURCE_HEAT_MULTIPLIER = 1.0
 
 MAX_ALLOWED_TEMPERATURE_C = 80.0
 
@@ -372,14 +370,282 @@ def weather_dissipation_factor(T_air_C: float, humidity: float) -> float:
     return float(np.clip(factor, 0.45, 1.80))
 
 
-def datacenter_cooling_overhead_factor(T_air_C: float) -> float:
-    """
-    Same useful IT load, but warmer outdoor air makes cooling less efficient.
+# ============================================================
+# 4b. DATACENTER HEAT BALANCE (MW) — IT, envelope, COP, PUE → PDE source
+# ============================================================
 
-    This adds some extra heat rejection overhead in warm weather.
+# Default DC room / chilled-water reference for COP model.
+DC_INDOOR_SETPOINT_C = 24.0
+U_ROOF_W_M2K = 0.35
+VENTILATION_ACH = 2.0
+
+
+def external_convection_h_W_m2K(wind_speed_m_s: float) -> float:
+    v = max(float(wind_speed_m_s), 0.0)
+    return 5.7 + 3.8 * v
+
+
+def conduction_loss_MW(
+    surfaces: List[Dict[str, Any]],
+    T_inside_C: float,
+    T_out_C: float,
+) -> float:
+    q_W = 0.0
+    for s in surfaces:
+        q_W += float(s["U_W_m2K"]) * float(s["A_m2"]) * (T_inside_C - T_out_C)
+    return q_W / 1e6
+
+
+def ventilation_loss_MW(
+    Vdot_m3_s: float,
+    T_inside_C: float,
+    T_out_C: float,
+    rho_air_kg_m3: float = 1.2,
+    cp_air_J_kgK: float = 1005.0,
+) -> float:
+    return (
+        rho_air_kg_m3
+        * cp_air_J_kgK
+        * float(Vdot_m3_s)
+        * (T_inside_C - T_out_C)
+        / 1e6
+    )
+
+
+def convection_loss_MW(
+    A_exposed_m2: float,
+    T_surface_C: float,
+    T_air_C: float,
+    wind_speed_m_s: float,
+) -> float:
+    h = external_convection_h_W_m2K(wind_speed_m_s)
+    return h * float(A_exposed_m2) * (T_surface_C - T_air_C) / 1e6
+
+
+def radiation_loss_MW(
+    emissivity: float,
+    A_exposed_m2: float,
+    T_surface_C: float,
+    T_sky_C: float,
+) -> float:
+    T_surface_K = T_surface_C + 273.15
+    T_sky_K = T_sky_C + 273.15
+    return (
+        float(emissivity)
+        * STEFAN_BOLTZMANN
+        * float(A_exposed_m2)
+        * (T_surface_K**4 - T_sky_K**4)
+        / 1e6
+    )
+
+
+def opaque_solar_gain_MW(
+    absorptivity: float,
+    A_solar_m2: float,
+    solar_wm2: float,
+) -> float:
+    return float(absorptivity) * float(A_solar_m2) * float(solar_wm2) / 1e6
+
+
+def window_solar_gain_MW(
+    SHGC: float,
+    A_window_m2: float,
+    solar_wm2: float,
+) -> float:
+    return float(SHGC) * float(A_window_m2) * float(solar_wm2) / 1e6
+
+
+def approximate_sky_temperature_C(T_air_C: float) -> float:
+    return float(T_air_C) - 6.0
+
+
+def chiller_COP_from_temperatures(
+    T_chilled_water_C: float,
+    T_outdoor_C: float,
+    condenser_approach_K: float = 8.0,
+    evaporator_approach_K: float = 5.0,
+    carnot_efficiency: float = 0.35,
+    COP_min: float = 1.2,
+    COP_max: float = 8.0,
+) -> float:
     """
-    factor = 1.0 + 0.025 * (T_air_C - 20.0)
-    return float(np.clip(factor, 0.80, 1.35))
+    Realistic chiller COP estimate from temperatures.
+
+    T_cold is evaporating-side temperature.
+    T_hot is condensing-side temperature.
+
+    Hotter outdoor air increases T_hot and naturally reduces COP.
+    Colder outdoor air lowers T_hot and naturally improves COP.
+    """
+    T_cold_K = T_chilled_water_C + 273.15 - evaporator_approach_K
+    T_hot_K = T_outdoor_C + 273.15 + condenser_approach_K
+    delta_T = max(T_hot_K - T_cold_K, 1.0)
+    COP_carnot = T_cold_K / delta_T
+    COP_real = carnot_efficiency * COP_carnot
+    return float(np.clip(COP_real, COP_min, COP_max))
+
+
+def pue_from_COP(
+    COP: float,
+    power_loss_factor: float = 0.06,
+    fan_pump_factor: float = 0.04,
+) -> float:
+    """
+    PUE = total facility power / IT power.
+
+    Approximation:
+        IT power = 1
+        cooling electric ≈ 1 / COP
+        electrical + fan/pump overhead = fixed fractions of IT power
+    """
+    return 1.0 + (1.0 / max(float(COP), 1e-6)) + power_loss_factor + fan_pump_factor
+
+
+def datacenter_heat_terms_MW(
+    *,
+    load_mw: float,
+    T_inside_C: float,
+    T_out_C: float,
+    T_surface_C: float,
+    wind_speed_m_s: float,
+    solar_wm2: float,
+    surfaces: List[Dict[str, Any]],
+    A_exposed_m2: float,
+    A_solar_m2: float,
+    Vdot_m3_s: float,
+    emissivity: float = 0.90,
+    absorptivity: float = 0.60,
+    SHGC: float = 0.35,
+    A_window_solar_m2: float = 0.0,
+    T_sky_C: float | None = None,
+    T_chilled_water_C: float = 12.0,
+    power_loss_factor: float = 0.06,
+    fan_pump_factor: float = 0.04,
+) -> Dict[str, float]:
+    """
+    Physically interpretable heat terms in MW for reporting + facility rejection.
+
+    ``Q_rejected_to_outdoor_MW`` is taken as ``load_mw * PUE`` (all facility power
+    eventually rejected as heat to the environment in this lumped model).
+    """
+    if T_sky_C is None:
+        T_sky_C = approximate_sky_temperature_C(T_out_C)
+
+    Q_it_MW = float(max(load_mw, 0.0))
+
+    Q_cond_loss_MW = conduction_loss_MW(
+        surfaces=surfaces,
+        T_inside_C=T_inside_C,
+        T_out_C=T_out_C,
+    )
+
+    Q_vent_loss_MW = ventilation_loss_MW(
+        Vdot_m3_s=Vdot_m3_s,
+        T_inside_C=T_inside_C,
+        T_out_C=T_out_C,
+    )
+
+    Q_conv_loss_MW = convection_loss_MW(
+        A_exposed_m2=A_exposed_m2,
+        T_surface_C=T_surface_C,
+        T_air_C=T_out_C,
+        wind_speed_m_s=wind_speed_m_s,
+    )
+
+    Q_rad_loss_MW = radiation_loss_MW(
+        emissivity=emissivity,
+        A_exposed_m2=A_exposed_m2,
+        T_surface_C=T_surface_C,
+        T_sky_C=float(T_sky_C),
+    )
+
+    Q_solar_opaque_MW = opaque_solar_gain_MW(
+        absorptivity=absorptivity,
+        A_solar_m2=A_solar_m2,
+        solar_wm2=solar_wm2,
+    )
+
+    Q_solar_window_MW = window_solar_gain_MW(
+        SHGC=SHGC,
+        A_window_m2=A_window_solar_m2,
+        solar_wm2=solar_wm2,
+    )
+
+    Q_solar_gain_MW = Q_solar_opaque_MW + Q_solar_window_MW
+
+    COP = chiller_COP_from_temperatures(
+        T_chilled_water_C=T_chilled_water_C,
+        T_outdoor_C=T_out_C,
+    )
+
+    PUE = pue_from_COP(
+        COP=COP,
+        power_loss_factor=power_loss_factor,
+        fan_pump_factor=fan_pump_factor,
+    )
+
+    Q_cooling_electric_MW = Q_it_MW / max(COP, 1e-9)
+
+    Q_facility_MW = Q_it_MW * PUE
+
+    Q_passive_net_MW = (
+        Q_it_MW
+        + Q_solar_gain_MW
+        - Q_cond_loss_MW
+        - Q_vent_loss_MW
+        - Q_conv_loss_MW
+        - Q_rad_loss_MW
+    )
+
+    Q_rejected_to_outdoor_MW = Q_facility_MW
+
+    return {
+        "Q_it_MW": Q_it_MW,
+        "Q_solar_opaque_MW": Q_solar_opaque_MW,
+        "Q_solar_window_MW": Q_solar_window_MW,
+        "Q_solar_gain_MW": Q_solar_gain_MW,
+        "Q_conduction_loss_MW": Q_cond_loss_MW,
+        "Q_ventilation_loss_MW": Q_vent_loss_MW,
+        "Q_convection_loss_MW": Q_conv_loss_MW,
+        "Q_radiation_loss_MW": Q_rad_loss_MW,
+        "Q_passive_net_MW": Q_passive_net_MW,
+        "COP": float(COP),
+        "PUE": float(PUE),
+        "Q_cooling_electric_MW": float(Q_cooling_electric_MW),
+        "Q_facility_MW": float(Q_facility_MW),
+        "Q_rejected_to_outdoor_MW": float(Q_rejected_to_outdoor_MW),
+    }
+
+
+def envelope_surfaces_and_areas(
+    dc_props: Dict[str, Any],
+    datacenter_specs: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], float, float, float, float]:
+    """
+    Build U×A surfaces and exposed / solar areas (m²) from datacenter property dicts.
+    """
+    U_wall = float(datacenter_specs["U_wall_W_m2K"])
+    U_window = float(datacenter_specs["U_window_W_m2K"])
+    A_opaque = float(dc_props["opaque_wall_area_m2"])
+    A_glass = float(dc_props["glass_area_m2"])
+    footprint = float(dc_props["footprint_area_m2"])
+
+    surfaces: List[Dict[str, Any]] = [
+        {"name": "opaque_wall", "U_W_m2K": U_wall, "A_m2": A_opaque},
+        {"name": "windows", "U_W_m2K": U_window, "A_m2": A_glass},
+        {"name": "roof", "U_W_m2K": U_ROOF_W_M2K, "A_m2": footprint},
+    ]
+
+    A_exposed_m2 = A_opaque + A_glass + footprint
+    A_solar_m2 = footprint
+    A_window_solar_m2 = A_glass
+
+    num_floors = max(int(datacenter_specs["num_floors"]), 1)
+    floor_h = float(datacenter_specs["floor_height_m"])
+    volume_m3 = max(footprint * num_floors * floor_h, 1.0)
+    Vdot_m3_s = VENTILATION_ACH * volume_m3 / 3600.0
+
+    return surfaces, A_exposed_m2, A_solar_m2, A_window_solar_m2, Vdot_m3_s
 
 
 def convective_heat_loss_W_m2(
@@ -651,6 +917,9 @@ def local_smooth_anomaly(
 # 7. MAIN PHYSICAL MODEL
 # ============================================================
 
+DEFAULT_IT_LOAD_REFERENCE_MW = 50.0
+
+
 def simulate_city_heat_one_case(
     buildings: np.ndarray,
     central_building_mask: np.ndarray,
@@ -667,6 +936,8 @@ def simulate_city_heat_one_case(
     steps: int = DEFAULT_STEPS,
     save_every: int = DEFAULT_SAVE_EVERY,
     return_states: bool = True,
+    wind_speed_m_s: float = 5.0,
+    load_mw: float | None = None,
 ) -> Tuple[Dict[str, float], np.ndarray, np.ndarray]:
 
     if datacenter_specs is None:
@@ -694,7 +965,53 @@ def simulate_city_heat_one_case(
     C_air = air_areal_heat_capacity(T_air)
 
     weather_factor = weather_dissipation_factor(T_air, humidity)
-    cooling_overhead_factor = datacenter_cooling_overhead_factor(T_air)
+
+    load_mw_eff = (
+        float(load_mw) if load_mw is not None else float(load) * DEFAULT_IT_LOAD_REFERENCE_MW
+    )
+    load_mw_eff = max(load_mw_eff, 0.0)
+
+    surfaces, A_exposed_m2, A_solar_m2, A_window_solar_m2, Vdot_m3_s = envelope_surfaces_and_areas(
+        dc_props, datacenter_specs
+    )
+
+    cell_area_m2 = float(dx) * float(dy)
+    source_area_m2 = float(source_cell_count) * cell_area_m2
+
+    T_inside_c = DC_INDOOR_SETPOINT_C
+    ws_m = float(max(wind_speed_m_s, 0.0))
+
+    # Passive envelope/convection/radiation reporting (does not change Q_rejected).
+    T_surface_guess = max(float(T_air), float(T_inside_c) - 2.0)
+
+    heat_terms_run = datacenter_heat_terms_MW(
+        load_mw=load_mw_eff,
+        T_inside_C=T_inside_c,
+        T_out_C=float(T_air),
+        T_surface_C=T_surface_guess,
+        wind_speed_m_s=ws_m,
+        solar_wm2=float(solar_radiation),
+        surfaces=surfaces,
+        A_exposed_m2=A_exposed_m2,
+        A_solar_m2=A_solar_m2,
+        Vdot_m3_s=Vdot_m3_s,
+        A_window_solar_m2=A_window_solar_m2,
+    )
+
+    Q_rejected_MW = heat_terms_run["Q_rejected_to_outdoor_MW"]
+    Q_source_W = Q_rejected_MW * 1e6
+    Q_source_W_m2 = SOURCE_HEAT_MULTIPLIER * Q_source_W / max(source_area_m2, 1e-9)
+
+    Q_central_solar = (
+        solar_radiation
+        * CENTRAL_BUILDING_SOLAR_ABSORPTION
+        * CENTRAL_SOLAR_TO_HEAT_FRACTION
+    )
+
+    Q_waste_density = Q_source_W_m2
+
+    # Heat source on central building: rejected facility heat + small roof shortwave term.
+    Q_source = Q_source_W_m2 * source_mask + Q_central_solar * source_mask
 
     street_mask = ~buildings
 
@@ -742,33 +1059,6 @@ def simulate_city_heat_one_case(
     # Cold weather has larger weather_factor -> stronger cooling.
     # Warm weather has smaller weather_factor -> weaker cooling.
     cooling_rate = BASE_COOLING_RATE * weather_factor
-
-    nonlinear_load = max(load, 0.0) ** LOAD_GAMMA
-
-    # Same useful IT load.
-    Q_power_density = dc_props["usable_power_density_W_m2"] * nonlinear_load
-
-    # Warmer weather makes cooling less efficient and increases rejected heat overhead.
-    Q_facility_density = (
-        Q_power_density
-        * dc_props["pue"]
-        * cooling_overhead_factor
-    )
-
-    Q_waste_density = Q_facility_density * dc_props["heat_rejection_fraction"]
-
-    Q_central_solar = (
-        solar_radiation
-        * CENTRAL_BUILDING_SOLAR_ABSORPTION
-        * CENTRAL_SOLAR_TO_HEAT_FRACTION
-    )
-
-    # Heat source exists only on the central building.
-    Q_source = (
-        SOURCE_HEAT_MULTIPLIER
-        * (Q_waste_density + Q_central_solar)
-        * source_mask
-    )
 
     H_env = dc_props["H_envelope_areal_W_m2K"]
 
@@ -850,6 +1140,20 @@ def simulate_city_heat_one_case(
     central_temp = float(T[central_building_mask].mean())
     central_anomaly = central_temp - T_air
 
+    heat_terms_final = datacenter_heat_terms_MW(
+        load_mw=load_mw_eff,
+        T_inside_C=T_inside_c,
+        T_out_C=float(T_air),
+        T_surface_C=central_temp,
+        wind_speed_m_s=ws_m,
+        solar_wm2=float(solar_radiation),
+        surfaces=surfaces,
+        A_exposed_m2=A_exposed_m2,
+        A_solar_m2=A_solar_m2,
+        Vdot_m3_s=Vdot_m3_s,
+        A_window_solar_m2=A_window_solar_m2,
+    )
+
     thermal_risk_objective = float(
         1.0 * float(T.max())
         + 0.01 * int(np.sum(T > 35.0))
@@ -857,8 +1161,10 @@ def simulate_city_heat_one_case(
         + 0.10 * int(np.sum(T > 45.0))
     )
 
-    metrics = {
+    metrics: Dict[str, Any] = {
         "load": float(load),
+        "load_mw": float(load_mw_eff),
+        "Q_source_W_m2": float(Q_source_W_m2),
         "source_heat_multiplier": float(SOURCE_HEAT_MULTIPLIER),
         "wind_x_m_s": float(wind_x),
         "wind_y_m_s": float(wind_y),
@@ -867,7 +1173,8 @@ def simulate_city_heat_one_case(
         "solar_radiation_W_m2": float(solar_radiation),
 
         "weather_dissipation_factor": float(weather_factor),
-        "datacenter_cooling_overhead_factor": float(cooling_overhead_factor),
+        "pue_nominal": float(dc_props["pue"]),
+        "ambient_wind_speed_m_s": ws_m,
         "air_density_kg_m3": float(air_density_from_temperature_C(T_air)),
         "air_areal_heat_capacity_J_m2K": float(C_air),
 
@@ -907,9 +1214,7 @@ def simulate_city_heat_one_case(
 
         "usable_power_density_W_m2": float(dc_props["usable_power_density_W_m2"]),
         "source_heat_density_W_m2": float(Q_waste_density),
-        "effective_source_heat_density_W_m2": float(
-            SOURCE_HEAT_MULTIPLIER * Q_waste_density
-        ),
+        "effective_source_heat_density_W_m2": float(SOURCE_HEAT_MULTIPLIER * Q_waste_density),
         "central_solar_heat_density_W_m2": float(Q_central_solar),
 
         "window_to_wall_ratio": float(dc_props["window_to_wall_ratio"]),
@@ -918,7 +1223,14 @@ def simulate_city_heat_one_case(
         "total_wall_area_m2": float(dc_props["total_wall_area_m2"]),
         "UA_total_W_K": float(dc_props["UA_total_W_K"]),
         "H_envelope_areal_W_m2K": float(dc_props["H_envelope_areal_W_m2K"]),
+        "heat_rejection_fraction": float(dc_props["heat_rejection_fraction"]),
+        "source_area_m2": float(source_area_m2),
+        "ventilation_Vdot_m3_s": float(Vdot_m3_s),
+        "dc_indoor_setpoint_C": float(T_inside_c),
     }
+
+    for key, val in heat_terms_final.items():
+        metrics[key] = float(val)
 
     states_arr = np.array(states) if return_states else np.empty((0, nx, ny))
 
@@ -929,28 +1241,33 @@ def simulate_city_heat_one_case(
 # 8. PLOTTING / SAVING
 # ============================================================
 
+def _style_clean_thermal_figure(fig, ax) -> None:
+    """Minimal chrome for dashboard + reports (no axes, no pixel labels)."""
+    ax.set_axis_off()
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.98)
+
+
 def plot_masks(
     buildings: np.ndarray,
     central_building_mask: np.ndarray,
     output_dir: Path,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(7, 6))
+    fig, ax = plt.subplots(figsize=(6.5, 6.5), facecolor="#0b1220")
+    ax.set_facecolor("#0b1220")
 
-    ax.imshow(buildings.T, origin="lower", cmap="gray_r")
+    ax.imshow(buildings.T, origin="lower", cmap="bone")
 
     ax.contour(
         central_building_mask.T,
         levels=[0.5],
-        colors="red",
-        linewidths=1.5,
+        colors="#f472b6",
+        linewidths=1.8,
     )
 
-    ax.set_title("City building mask with central heat-source building")
-    ax.set_xlabel("x pixel")
-    ax.set_ylabel("y pixel")
-
-    fig.tight_layout()
-    fig.savefig(output_dir / "01_building_masks.png", dpi=200)
+    _style_clean_thermal_figure(fig, ax)
+    fig.savefig(output_dir / "01_building_masks.png", dpi=200, facecolor=fig.get_facecolor())
     plt.close(fig)
 
 
@@ -965,7 +1282,8 @@ def plot_final_temperature(
 ) -> None:
     anomaly = T_final - T_air
 
-    fig, ax = plt.subplots(figsize=(7, 6))
+    fig, ax = plt.subplots(figsize=(6.5, 6.5), facecolor="#0b1220")
+    ax.set_facecolor("#0b1220")
 
     vmax_temp = max(float(np.percentile(T_final, 99.7)), T_air + 1.0)
 
@@ -981,7 +1299,53 @@ def plot_final_temperature(
         buildings.T,
         levels=[0.5],
         colors="cyan",
-        linewidths=0.25,
+        linewidths=0.35,
+        alpha=0.65,
+    )
+
+    ax.contour(
+        central_building_mask.T,
+        levels=[0.5],
+        colors="white",
+        linewidths=1.5,
+    )
+
+    _style_clean_thermal_figure(fig, ax)
+    tmax = float(T_final.max())
+    fig.text(
+        0.04,
+        0.94,
+        f"Ambient {T_air:.1f}°C · peak {tmax:.1f}°C",
+        color="white",
+        fontsize=11,
+        fontweight="bold",
+        va="top",
+        ha="left",
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="#020617", edgecolor="white", alpha=0.75),
+    )
+
+    fig.savefig(output_dir / "02_final_temperature.png", dpi=200, facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6.5, 6.5), facecolor="#0b1220")
+    ax.set_facecolor("#0b1220")
+
+    vmax_anomaly = max(float(np.percentile(anomaly, 99.7)), 0.5)
+
+    ax.imshow(
+        anomaly.T,
+        origin="lower",
+        cmap="RdYlBu_r",
+        vmin=0.0,
+        vmax=vmax_anomaly,
+    )
+
+    ax.contour(
+        buildings.T,
+        levels=[0.5],
+        colors="white",
+        linewidths=0.3,
+        alpha=0.5,
     )
 
     ax.contour(
@@ -991,67 +1355,20 @@ def plot_final_temperature(
         linewidths=1.4,
     )
 
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Temperature [°C]")
-
-    ax.set_title(f"Final temperature field, ambient = {T_air:.1f} °C")
-    ax.set_xlabel("x pixel")
-    ax.set_ylabel("y pixel")
-
-    arrow_scale = 22
-
-    ax.arrow(
-        8,
-        8,
-        arrow_scale * wind_x,
-        arrow_scale * wind_y,
+    _style_clean_thermal_figure(fig, ax)
+    fig.text(
+        0.04,
+        0.94,
+        f"ΔT above ambient (max {float(anomaly.max()):.2f}°C)",
         color="white",
-        width=0.6,
-        head_width=4,
-        length_includes_head=True,
+        fontsize=11,
+        fontweight="bold",
+        va="top",
+        ha="left",
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="#020617", edgecolor="white", alpha=0.75),
     )
 
-    ax.text(8, 17, "wind", color="white", fontsize=11)
-
-    fig.tight_layout()
-    fig.savefig(output_dir / "02_final_temperature.png", dpi=200)
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(7, 6))
-
-    vmax_anomaly = max(float(np.percentile(anomaly, 99.7)), 0.5)
-
-    im = ax.imshow(
-        anomaly.T,
-        origin="lower",
-        cmap="coolwarm",
-        vmin=0.0,
-        vmax=vmax_anomaly,
-    )
-
-    ax.contour(
-        buildings.T,
-        levels=[0.5],
-        colors="black",
-        linewidths=0.25,
-    )
-
-    ax.contour(
-        central_building_mask.T,
-        levels=[0.5],
-        colors="yellow",
-        linewidths=1.4,
-    )
-
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Temperature anomaly [°C]")
-
-    ax.set_title(f"Final heat-island anomaly, ambient = {T_air:.1f} °C")
-    ax.set_xlabel("x pixel")
-    ax.set_ylabel("y pixel")
-
-    fig.tight_layout()
-    fig.savefig(output_dir / "03_final_anomaly.png", dpi=200)
+    fig.savefig(output_dir / "03_final_anomaly.png", dpi=200, facecolor=fig.get_facecolor())
     plt.close(fig)
 
 
@@ -1069,7 +1386,8 @@ def save_animation(
     if states.size == 0 or len(states) < 2:
         return
 
-    fig, ax = plt.subplots(figsize=(7, 6))
+    fig, ax = plt.subplots(figsize=(6.5, 6.5), facecolor="#0b1220")
+    ax.set_facecolor("#0b1220")
 
     vmax = max(float(np.percentile(states, 99.7)), T_air + 1.0)
 
@@ -1085,7 +1403,8 @@ def save_animation(
         buildings.T,
         levels=[0.5],
         colors="cyan",
-        linewidths=0.20,
+        linewidths=0.28,
+        alpha=0.55,
     )
 
     ax.contour(
@@ -1095,36 +1414,20 @@ def save_animation(
         linewidths=1.2,
     )
 
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Temperature [°C]")
-
-    title = ax.set_title(f"Heat plume evolution, ambient = {T_air:.1f} °C")
-
-    ax.set_xlabel("x pixel")
-    ax.set_ylabel("y pixel")
-
-    arrow_scale = 22
-
-    ax.arrow(
-        8,
-        8,
-        arrow_scale * wind_x,
-        arrow_scale * wind_y,
+    _style_clean_thermal_figure(fig, ax)
+    title = fig.suptitle(
+        f"Heat plume · {T_air:.1f}°C ambient",
         color="white",
-        width=0.6,
-        head_width=4,
-        length_includes_head=True,
+        fontsize=12,
+        fontweight="bold",
+        y=0.98,
     )
-
-    ax.text(8, 17, "wind", color="white", fontsize=11)
 
     def update(frame: int):
         im.set_data(states[frame].T)
 
         minutes = frame * save_every * dt / 60.0
-        title.set_text(
-            f"Heat plume evolution, ambient = {T_air:.1f} °C, t = {minutes:.1f} min"
-        )
+        title.set_text(f"Heat plume · {T_air:.1f}°C · t = {minutes:.1f} min")
 
         return [im, title]
 
@@ -1141,6 +1444,7 @@ def save_animation(
             output_dir / "04_heat_plume_animation.gif",
             writer="pillow",
             fps=15,
+            savefig_kwargs={"facecolor": fig.get_facecolor()},
         )
     except Exception as exc:
         print(f"Could not save GIF animation. Reason: {exc}")
@@ -1155,15 +1459,15 @@ def _humidity_fraction(humidity: float) -> float:
     return float(np.clip(h, 0.0, 1.0))
 
 
-def mw_it_load_multiplier(load_mw: float, reference_mw: float = 68.0) -> float:
+def mw_it_load_multiplier(load_mw: float, reference_mw: float = 50.0) -> float:
     """
     Map dashboard MW to the model's dimensionless IT load input.
 
     Reference: ~68 MW corresponds to internal load factor ~3 (similar to DEFAULT_LOAD).
     """
     ref = max(float(reference_mw), 1.0)
-    x = (float(load_mw) / ref) * 3.0
-    return float(np.clip(x, 0.3, 30.0))
+    x = (float(load_mw) / ref) #* 3.0
+    return float(x)#np.clip(x, 0.3, 30.0))
 
 
 def wind_cardinal_to_components(
@@ -1296,6 +1600,8 @@ def run_physical_simulation_for_params(
         steps=steps,
         save_every=save_every,
         return_states=return_states,
+        wind_speed_m_s=max(float(wind_speed_m_s), 0.0),
+        load_mw=float(load_mw),
     )
 
     if write_disk:
@@ -1441,9 +1747,11 @@ def main() -> None:
     print(f"Ambient temperature [C]: {metrics['T_air_C']:.3f}")
     print(f"Weather dissipation factor: {metrics['weather_dissipation_factor']:.3f}")
     print(
-        "Datacenter cooling overhead factor: "
-        f"{metrics['datacenter_cooling_overhead_factor']:.3f}"
+        f"PUE (from COP + overheads): {metrics['PUE']:.3f}  "
+        f"(nominal design PUE {metrics['pue_nominal']:.3f}, COP {metrics['COP']:.3f}, "
+        f"Q_rejected {metrics['Q_rejected_to_outdoor_MW']:.4f} MW)"
     )
+    print(f"Q_source (facility) [W/m²]: {metrics['Q_source_W_m2']:.3f}")
     print(f"Air density [kg/m3]: {metrics['air_density_kg_m3']:.3f}")
     print(f"Air areal heat capacity [J/m2K]: {metrics['air_areal_heat_capacity_J_m2K']:.3f}")
 

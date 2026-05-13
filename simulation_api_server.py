@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import traceback
 import uuid
 from pathlib import Path
@@ -26,10 +27,12 @@ from pydantic import BaseModel, Field
 from bayes_optimizer import (
     OUTPUT_ROOT as OPT_OUTPUT_ROOT,
     build_per_site_bounds,
+    clear_load_optimization_output_dir,
     collect_final_run_asset_paths,
     compute_single_datacenter_objective,
     compute_total_objective,
     optimize_datacenter_loads_iter,
+    project_loads_to_bounds,
     rerun_best_with_full_outputs,
     write_optimization_report_bundle,
 )
@@ -61,6 +64,18 @@ class OptimizeRequest(BaseModel):
     extra_total_load_mw: float = Field(
         ...,
         description="Total additional MW to spread across sites (Bayes search).",
+    )
+    bayesian_loop_count: int = Field(
+        12,
+        ge=4,
+        le=80,
+        description="Number of global load-split candidates (Dirichlet + structured seeds).",
+    )
+    top_k_refine: int = Field(
+        2,
+        ge=1,
+        le=8,
+        description="How many best global candidates receive local coordinate refinement.",
     )
 
 
@@ -141,6 +156,18 @@ def _optimize_stream(req: OptimizeRequest) -> Iterator[bytes]:
     run_id = f"opt_{uuid.uuid4().hex[:14]}"
 
     try:
+        yield _json_line(
+            {
+                "type": "log",
+                "phase": "init",
+                "message": "Clearing previous results in load_optimization_outputs/ …",
+            }
+        )
+        clear_load_optimization_output_dir()
+
+        n_loops = int(req.bayesian_loop_count)
+        top_k = int(req.top_k_refine)
+
         for event in optimize_datacenter_loads_iter(
             dcs,
             base_loads_mw=base_loads,
@@ -148,10 +175,20 @@ def _optimize_stream(req: OptimizeRequest) -> Iterator[bytes]:
             min_loads_mw=min_l,
             max_loads_mw=max_l,
             run_id=run_id,
+            n_global_candidates=n_loops,
+            top_k_refine=top_k,
         ):
             if event.get("type") == "complete":
+                sites_out: list[dict[str, Any]] = []
                 full = event["result"]
                 best_loads = np.asarray(full["best_loads_mw"], dtype=float)
+                target_total_mw = float(base_loads.sum() + extra)
+                best_loads = project_loads_to_bounds(
+                    np.maximum(best_loads, base_loads),
+                    min_l,
+                    max_l,
+                    target_total_mw,
+                )
                 yield _json_line(
                     {
                         "type": "log",
@@ -169,7 +206,7 @@ def _optimize_stream(req: OptimizeRequest) -> Iterator[bytes]:
                 obj_final = float(compute_total_objective(final_results))
                 assets = collect_final_run_asset_paths(run_id, dcs, final_results)
                 run_root = OPT_OUTPUT_ROOT / run_id
-                write_optimization_report_bundle(
+                _, _, chart_paths = write_optimization_report_bundle(
                     run_root=run_root,
                     run_id=run_id,
                     datacenters=dcs,
@@ -183,7 +220,15 @@ def _optimize_stream(req: OptimizeRequest) -> Iterator[bytes]:
                     final_asset_rel=assets,
                 )
 
-                sites_out: list[dict[str, Any]] = []
+                scratch = OPT_OUTPUT_ROOT / run_id / "_scratch_eval"
+                if scratch.is_dir():
+                    shutil.rmtree(scratch, ignore_errors=True)
+
+                chart_urls = {
+                    k: f"/opt-out/{run_id}/{fn}"
+                    for k, fn in (chart_paths or {}).items()
+                    if fn
+                }
                 for i, site in enumerate(req.sites):
                     od = Path(final_results[i]["output_dir"])
                     rel_to_opt = od.relative_to(OPT_OUTPUT_ROOT).as_posix()
@@ -223,6 +268,9 @@ def _optimize_stream(req: OptimizeRequest) -> Iterator[bytes]:
                             "sites": sites_out,
                             "global_slim": full["global_slim"],
                             "refined_slim": full["refined_slim"],
+                            "chart_urls": chart_urls,
+                            "bayesian_loop_count": n_loops,
+                            "top_k_refine": top_k,
                         },
                     }
                 )
