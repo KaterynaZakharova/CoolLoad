@@ -81,41 +81,160 @@ def clear_load_optimization_output_dir(root: Path | None = None) -> None:
 # 2. OBJECTIVE
 # ============================================================
 
+# Objective weights for load spreading.
+# Main idea:
+#   - strongly minimize the worst temperature rise above ambient
+#   - penalize imbalance between datacenter deltas
+#   - mildly penalize total delta
+#   - optionally penalize hot plume area
+#
+# Increase OBJECTIVE_WEIGHT_WORST_DELTA if optimizer still puts too much
+# load into one datacenter.
+OBJECTIVE_WEIGHT_WORST_DELTA = 20.0
+OBJECTIVE_WEIGHT_SUM_DELTA = 1.0
+OBJECTIVE_WEIGHT_DELTA_STD = 10.0
+OBJECTIVE_WEIGHT_HOT_AREA = 0.01
+
+# Smooth max parameter.
+# Larger = closer to true max.
+# Smaller = smoother for Gaussian Process BO.
+OBJECTIVE_SMOOTH_MAX_BETA = 6.0
+
+# Optional absolute-temperature safety penalty.
+# This prevents choosing a cold site with acceptable delta but high absolute temp.
+OBJECTIVE_WEIGHT_ABSOLUTE_TEMP = 0.15
+
+
+def _get_metrics(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Accept both:
+        result = {"metrics": {...}}
+    and:
+        result = {...}
+    """
+    return result["metrics"] if "metrics" in result else result
+
+
+def smooth_max(values: np.ndarray, beta: float = OBJECTIVE_SMOOTH_MAX_BETA) -> float:
+    """
+    Smooth approximation of max(values).
+
+    Useful for Bayesian optimization because it is less abrupt than raw max().
+    """
+    values = np.asarray(values, dtype=float).reshape(-1)
+
+    if values.size == 0:
+        return 0.0
+
+    m = float(np.max(values))
+    return float(m + np.log(np.sum(np.exp(beta * (values - m)))) / beta)
+
+
 def compute_single_datacenter_objective(metrics: Dict[str, Any]) -> float:
     """
-    Lower is better.
+    Per-site diagnostic objective.
 
-    Minimize thermal ΔT at the datacenter (central building vs ambient) and the
-    domain-mean anomaly, plus a term on mean absolute temperature over the grid
-    (``mean_temp_C`` from the physics run).
-
-    The global Bayes score is the sum of this quantity over all sites.
+    This is mostly used for reporting in slim_eval_results().
+    The true allocation objective is compute_total_objective(), because load
+    spreading requires comparing all datacenters together.
     """
-    central_dt = float(metrics.get("central_building_anomaly_C", 0.0))
-    mean_dt = float(metrics.get("mean_anomaly_C", 0.0))
-    mean_temp = float(metrics.get("mean_temp_C", 0.0))
+    central_delta = float(metrics.get("central_building_anomaly_C", 0.0))
+    max_delta = float(metrics.get("max_anomaly_C", central_delta))
+    mean_delta = float(metrics.get("mean_anomaly_C", 0.0))
+
+    hot1 = float(metrics.get("hot_area_gt_1C_cells", 0.0))
+    hot2 = float(metrics.get("hot_area_gt_2C_cells", 0.0))
+    hot5 = float(metrics.get("hot_area_gt_5C_cells", 0.0))
+
+    hot_area_penalty = hot1 + 3.0 * hot2 + 10.0 * hot5
 
     return float(
-        central_dt
-        + mean_dt
-        + OBJECTIVE_WEIGHT_MEAN_TEMP_C * mean_temp
+        2.0 * max_delta
+        + 1.0 * central_delta
+        + 0.5 * mean_delta
+        + OBJECTIVE_WEIGHT_HOT_AREA * hot_area_penalty
     )
 
 
 def compute_total_objective(results: List[Dict[str, Any]]) -> float:
     """
-    Total load-allocation objective.
+    Load-spreading objective for Bayesian optimization.
 
-    Sum of per-site (central ΔT + mean-field ΔT + weighted mean temperature); the
-    optimizer minimizes this scalar.
+    Lower is better.
+
+    This objective is designed to avoid the trivial solution:
+        "put everything into the single coldest/best datacenter."
+
+    It minimizes:
+        1. worst temperature delta across datacenters,
+        2. imbalance of temperature deltas,
+        3. total temperature delta,
+        4. hot plume area,
+        5. mild absolute-temperature risk.
+
+    The most important term is the smooth worst-delta term.
     """
-    total = 0.0
+    if len(results) == 0:
+        return 0.0
+
+    max_deltas = []
+    central_deltas = []
+    mean_deltas = []
+    max_temps = []
+    hot_area_penalty = 0.0
 
     for result in results:
-        metrics = result["metrics"]
-        total += compute_single_datacenter_objective(metrics)
+        metrics = _get_metrics(result)
 
-    return float(total)
+        central_delta = float(metrics.get("central_building_anomaly_C", 0.0))
+        max_delta = float(metrics.get("max_anomaly_C", central_delta))
+        mean_delta = float(metrics.get("mean_anomaly_C", 0.0))
+        max_temp = float(metrics.get("max_temp_C", 0.0))
+
+        hot1 = float(metrics.get("hot_area_gt_1C_cells", 0.0))
+        hot2 = float(metrics.get("hot_area_gt_2C_cells", 0.0))
+        hot5 = float(metrics.get("hot_area_gt_5C_cells", 0.0))
+
+        max_deltas.append(max_delta)
+        central_deltas.append(central_delta)
+        mean_deltas.append(mean_delta)
+        max_temps.append(max_temp)
+
+        hot_area_penalty += hot1 + 3.0 * hot2 + 10.0 * hot5
+
+    max_deltas = np.asarray(max_deltas, dtype=float)
+    central_deltas = np.asarray(central_deltas, dtype=float)
+    mean_deltas = np.asarray(mean_deltas, dtype=float)
+    max_temps = np.asarray(max_temps, dtype=float)
+
+    # Main spreading metric:
+    # if one datacenter gets overloaded, its delta rises and this term grows fast.
+    worst_delta_smooth = smooth_max(max_deltas)
+
+    # Imbalance terms:
+    # make the optimizer prefer similar thermal stress across sites.
+    max_delta_std = float(np.std(max_deltas))
+    central_delta_std = float(np.std(central_deltas))
+
+    # Total heating terms:
+    # keep the overall plume small, but do not let this dominate.
+    sum_max_delta = float(np.sum(max_deltas))
+    sum_mean_delta = float(np.sum(mean_deltas))
+
+    # Mild absolute thermal safety:
+    # keeps very hot absolute temperature from being ignored.
+    worst_abs_temp = smooth_max(max_temps)
+
+    objective = (
+        OBJECTIVE_WEIGHT_WORST_DELTA * worst_delta_smooth
+        + OBJECTIVE_WEIGHT_SUM_DELTA * sum_max_delta
+        + OBJECTIVE_WEIGHT_DELTA_STD * (max_delta_std + central_delta_std)
+        + OBJECTIVE_WEIGHT_HOT_AREA * hot_area_penalty
+        + OBJECTIVE_WEIGHT_ABSOLUTE_TEMP * worst_abs_temp
+        + 0.25 * sum_mean_delta
+    )
+
+    return float(objective)
 
 
 # ============================================================
