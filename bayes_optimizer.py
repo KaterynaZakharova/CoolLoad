@@ -90,15 +90,15 @@ def clear_load_optimization_output_dir(root: Path | None = None) -> None:
 #
 # Increase OBJECTIVE_WEIGHT_WORST_DELTA if optimizer still puts too much
 # load into one datacenter.
-OBJECTIVE_WEIGHT_WORST_DELTA = 20.0
-OBJECTIVE_WEIGHT_SUM_DELTA = 1.0
-OBJECTIVE_WEIGHT_DELTA_STD = 10.0
+OBJECTIVE_WEIGHT_WORST_DELTA = 60.0
+OBJECTIVE_WEIGHT_SUM_DELTA = 0.2
+OBJECTIVE_WEIGHT_DELTA_STD = 40.0
 OBJECTIVE_WEIGHT_HOT_AREA = 0.01
 
 # Smooth max parameter.
 # Larger = closer to true max.
 # Smaller = smoother for Gaussian Process BO.
-OBJECTIVE_SMOOTH_MAX_BETA = 6.0
+OBJECTIVE_SMOOTH_MAX_BETA = 8.0
 
 # Optional absolute-temperature safety penalty.
 # This prevents choosing a cold site with acceptable delta but high absolute temp.

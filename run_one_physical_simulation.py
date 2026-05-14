@@ -13,6 +13,8 @@ Main behavior:
     - no periodic np.roll artifacts
     - outdoor heat loss uses physical convection and incremental longwave radiation
     - horizontal heat spreading uses a wind/mixing-length eddy diffusivity
+    - transport wind and convective-cooling wind are separated so stronger wind
+      removes heat instead of only spreading the plume
 
 Required:
     from buildings_latlon import latlon_to_central_building_mask
@@ -74,6 +76,19 @@ SOURCE_BUILDING_HEAT_CAPACITY_FACTOR = 2.2
 
 BUILDING_WIND_REDUCTION = 0.35
 SOURCE_BUILDING_WIND_REDUCTION = 0.05
+
+# Wind has two physical roles. Transport/advection can be strongly blocked by
+# buildings, but convective cooling on exposed roofs/walls should still feel
+# most of the ambient wind. If we use the strongly reduced transport wind for
+# convection too, stronger wind can look falsely worse because it only spreads
+# heat without removing enough heat from the hot source.
+BUILDING_CONVECTIVE_WIND_REDUCTION = 0.65
+SOURCE_BUILDING_CONVECTIVE_WIND_REDUCTION = 0.85
+
+# Prevent unrealistically huge W/m² if the rasterized central building occupies
+# only a few pixels. Facility heat rejection should be distributed over at least
+# the physical roof/footprint scale.
+USE_PHYSICAL_FOOTPRINT_FOR_SOURCE_AREA = True
 
 # Solar is applied only to the central building/source roof.
 CENTRAL_BUILDING_SOLAR_ABSORPTION = 0.55
@@ -1046,7 +1061,13 @@ def simulate_city_heat_one_case(
     )
 
     cell_area_m2 = float(dx) * float(dy)
-    source_area_m2 = float(source_cell_count) * cell_area_m2
+    mask_source_area_m2 = float(source_cell_count) * cell_area_m2
+    physical_roof_area_m2 = float(dc_props["footprint_area_m2"])
+
+    if USE_PHYSICAL_FOOTPRINT_FOR_SOURCE_AREA:
+        source_area_m2 = max(mask_source_area_m2, physical_roof_area_m2)
+    else:
+        source_area_m2 = mask_source_area_m2
 
     T_inside_c = DC_INDOOR_SETPOINT_C
     ws_m = float(max(wind_speed_m_s, 0.0))
@@ -1087,21 +1108,42 @@ def simulate_city_heat_one_case(
         + Q_central_solar_W_m2 * source_mask
     )
 
-    wind_reduction = np.where(buildings, BUILDING_WIND_REDUCTION, 1.0)
-    wind_reduction = np.where(
+    # ------------------------------------------------------------
+    # Wind fields: transport wind vs convective-cooling wind
+    # ------------------------------------------------------------
+    # Transport/advection wind is strongly blocked by buildings.
+    transport_wind_reduction = np.where(buildings, BUILDING_WIND_REDUCTION, 1.0)
+    transport_wind_reduction = np.where(
         central_building_mask,
         SOURCE_BUILDING_WIND_REDUCTION,
-        wind_reduction,
+        transport_wind_reduction,
     )
 
-    u = wind_x * wind_reduction
-    v = wind_y * wind_reduction
-    local_wind_speed = np.sqrt(u**2 + v**2)
+    u = wind_x * transport_wind_reduction
+    v = wind_y * transport_wind_reduction
+    transport_wind_speed = np.sqrt(u**2 + v**2)
+
+    # Convective cooling wind should not be reduced as aggressively as the
+    # street-level transport wind. Exposed walls, roofs, and exhaust plumes
+    # still exchange heat with outdoor flow, so stronger ambient wind should
+    # increase heat removal even if urban geometry blocks part of the advection.
+    ambient_wind_speed = float(max(wind_speed_m_s, 0.0))
+    convective_wind_speed = np.ones_like(transport_wind_speed) * ambient_wind_speed
+    convective_wind_speed = np.where(
+        buildings,
+        BUILDING_CONVECTIVE_WIND_REDUCTION * ambient_wind_speed,
+        convective_wind_speed,
+    )
+    convective_wind_speed = np.where(
+        central_building_mask,
+        SOURCE_BUILDING_CONVECTIVE_WIND_REDUCTION * ambient_wind_speed,
+        convective_wind_speed,
+    )
 
     alpha = urban_eddy_diffusivity_field(
         buildings=buildings,
         central_building_mask=central_building_mask,
-        wind_speed=local_wind_speed,
+        wind_speed=transport_wind_speed,
         dx=dx,
         dy=dy,
     )
@@ -1151,7 +1193,7 @@ def simulate_city_heat_one_case(
         q_conv = convective_heat_loss_W_m2(
             T=T,
             T_air_C=T_air,
-            wind_speed=local_wind_speed,
+            wind_speed=convective_wind_speed,
             exposure_fraction=exposure_fraction,
         )
         dTdt_conv = -q_conv / C_eff
@@ -1237,7 +1279,8 @@ def simulate_city_heat_one_case(
         "wind_x_m_s": float(wind_x),
         "wind_y_m_s": float(wind_y),
         "ambient_wind_speed_m_s": float(ws_m),
-        "mean_local_wind_speed_m_s": float(np.mean(local_wind_speed)),
+        "mean_transport_wind_speed_m_s": float(np.mean(transport_wind_speed)),
+        "mean_convective_wind_speed_m_s": float(np.mean(convective_wind_speed)),
 
         "T_air_C": float(T_air),
         "humidity": float(humidity),
@@ -1252,7 +1295,7 @@ def simulate_city_heat_one_case(
             effective_sky_temperature_C(T_air, humidity)
         ),
         "mean_convective_h_W_m2K": float(
-            np.mean(external_convection_h_W_m2K(local_wind_speed))
+            np.mean(external_convection_h_W_m2K(convective_wind_speed))
         ),
         "mean_exposure_fraction": float(np.mean(exposure_fraction)),
 
@@ -1290,6 +1333,8 @@ def simulate_city_heat_one_case(
 
         "building_cells": int(buildings.sum()),
         "central_building_cells": int(source_cell_count),
+        "mask_source_area_m2": float(mask_source_area_m2),
+        "physical_roof_area_m2": float(physical_roof_area_m2),
         "source_area_m2": float(source_area_m2),
 
         "usable_power_density_W_m2": float(dc_props["usable_power_density_W_m2"]),
@@ -1855,6 +1900,8 @@ def main() -> None:
     print(f"Air areal heat capacity [J/m2K]: {metrics['air_areal_heat_capacity_J_m2K']:.3f}")
     print(f"Effective sky temperature [C]: {metrics['effective_sky_temperature_C']:.3f}")
 
+    print(f"Mean transport wind [m/s]: {metrics['mean_transport_wind_speed_m_s']:.3f}")
+    print(f"Mean convective wind [m/s]: {metrics['mean_convective_wind_speed_m_s']:.3f}")
     print(f"Mean convective h [W/m2K]: {metrics['mean_convective_h_W_m2K']:.3f}")
     print(f"Mean exposure fraction: {metrics['mean_exposure_fraction']:.3f}")
     print(f"Mean alpha [m2/s]: {metrics['alpha_mean_m2_s']:.4f}")
@@ -1868,7 +1915,9 @@ def main() -> None:
 
     print(f"Building cells: {metrics['building_cells']}")
     print(f"Central building cells: {metrics['central_building_cells']}")
-    print(f"Source area [m2]: {metrics['source_area_m2']:.3f}")
+    print(f"Mask source area [m2]: {metrics['mask_source_area_m2']:.3f}")
+    print(f"Physical roof area [m2]: {metrics['physical_roof_area_m2']:.3f}")
+    print(f"Effective source area [m2]: {metrics['source_area_m2']:.3f}")
 
     print(f"Central building temperature [C]: {metrics['central_building_temperature_C']:.3f}")
     print(f"Central building delta above ambient [C]: {metrics['central_building_anomaly_C']:.3f}")
