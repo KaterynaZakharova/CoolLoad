@@ -473,6 +473,16 @@ def run_one_dc_with_load(
     else:
         save_numpy_flag = bool(save_numpy) and not fast_evaluation
 
+    sim_kwargs: Dict[str, Any] = {}
+    if datacenter.get("datacenter_specs") is not None:
+        sim_kwargs["datacenter_specs"] = datacenter["datacenter_specs"]
+    elif datacenter.get("wall_specific_heat_kj_per_kg_k") is not None:
+        sim_kwargs["wall_specific_heat_kj_per_kg_k"] = float(datacenter["wall_specific_heat_kj_per_kg_k"])
+        if datacenter.get("wall_density_kg_m3") is not None:
+            sim_kwargs["wall_density_kg_m3"] = float(datacenter["wall_density_kg_m3"])
+        if datacenter.get("wall_material") is not None:
+            sim_kwargs["wall_material"] = str(datacenter["wall_material"])
+
     result = run_physical_simulation_for_params(
         lat=float(datacenter["lat"]),
         lon=float(datacenter["lon"]),
@@ -499,6 +509,7 @@ def run_one_dc_with_load(
         save_numpy=save_numpy_flag,
         save_metadata_json=not fast_evaluation,
         verbose=verbose,
+        **sim_kwargs,
     )
 
     return result

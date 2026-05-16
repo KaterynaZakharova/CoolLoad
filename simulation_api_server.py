@@ -10,15 +10,17 @@ Run from repo root:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
+import tempfile
 import traceback
 import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +38,7 @@ from bayes_optimizer import (
     rerun_best_with_full_outputs,
     write_optimization_report_bundle,
 )
+from pdf_extractor import extract_pdf_resources_bundle
 from run_one_physical_simulation import run_physical_simulation_for_params
 
 ROOT = Path(__file__).resolve().parent
@@ -50,6 +53,14 @@ class WeatherIn(BaseModel):
     windDirection: str = "N"
 
 
+class PhysicsWallIn(BaseModel):
+    """Opaque wall + slab volumetric heat capacity via rho * Cp (Cp in kJ/kg·K)."""
+
+    material: str | None = None
+    specific_heat_kj_per_kg_k: float | None = None
+    density_kg_m3: float | None = None
+
+
 class SiteOpt(BaseModel):
     id: str
     name: str
@@ -57,6 +68,7 @@ class SiteOpt(BaseModel):
     lon: float
     base_load_mw: float = Field(..., description="Current site IT load in MW")
     weather: WeatherIn
+    physics: PhysicsWallIn | None = None
 
 
 class OptimizeRequest(BaseModel):
@@ -88,6 +100,7 @@ class SiteIn(BaseModel):
         description="IT load in MW for this site (e.g. base + redistributed extra).",
     )
     weather: WeatherIn
+    physics: PhysicsWallIn | None = None
 
 
 class BatchRequest(BaseModel):
@@ -103,6 +116,19 @@ def _json_line(obj: Any) -> bytes:
     return (json.dumps(obj, default=str) + "\n").encode("utf-8")
 
 
+def _physics_wall_to_dc_keys(p: PhysicsWallIn | None) -> dict[str, Any]:
+    if p is None:
+        return {}
+    out: dict[str, Any] = {}
+    if p.material is not None:
+        out["wall_material"] = str(p.material)
+    if p.specific_heat_kj_per_kg_k is not None:
+        out["wall_specific_heat_kj_per_kg_k"] = float(p.specific_heat_kj_per_kg_k)
+    if p.density_kg_m3 is not None:
+        out["wall_density_kg_m3"] = float(p.density_kg_m3)
+    return out
+
+
 def _site_to_dc(site: SiteOpt) -> dict[str, Any]:
     return {
         "name": site.name,
@@ -113,6 +139,7 @@ def _site_to_dc(site: SiteOpt) -> dict[str, Any]:
         "solar_wm2": float(site.weather.solar),
         "wind_speed_m_s": float(site.weather.windSpeed),
         "wind_direction": str(site.weather.windDirection),
+        **_physics_wall_to_dc_keys(site.physics),
     }
 
 
@@ -135,6 +162,45 @@ app.mount("/opt-out", StaticFiles(directory=str(OPT_OUTPUT_ROOT)), name="opt_out
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/api/pdf-extract")
+def pdf_extract(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Upload a PDF; return specs, thermal capacity rows, optional geocode, warnings."""
+    name = (file.filename or "").lower()
+    if not name.endswith(".pdf"):
+        return {"ok": False, "error": "Expected a .pdf file.", "specs": {}, "thermal_capacities": [], "location": None, "warnings": []}
+
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp_path = tmp.name
+            shutil.copyfileobj(file.file, tmp)
+    finally:
+        try:
+            file.file.close()
+        except Exception:
+            pass
+
+    try:
+        if not tmp_path:
+            return {"ok": False, "error": "Could not store upload.", "specs": {}, "thermal_capacities": [], "location": None, "warnings": []}
+        sz = Path(tmp_path).stat().st_size
+        try: 
+            out = extract_pdf_resources_bundle(tmp_path, try_geocode=True)
+            return out
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "specs": {},
+                "thermal_capacities": [],
+                "location": None,
+                "warnings": [traceback.format_exc()],
+            }
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 def _optimize_stream(req: OptimizeRequest) -> Iterator[bytes]:
@@ -301,6 +367,15 @@ def simulate_batch(req: BatchRequest) -> dict[str, Any]:
     for site in req.sites:
         sub = safe_site_subdir(site.id)
         out_dir = SIM_OUTPUT_ROOT / sub
+        sim_extras: dict[str, Any] = {}
+        if site.physics is not None:
+            p = site.physics
+            if p.specific_heat_kj_per_kg_k is not None:
+                sim_extras["wall_specific_heat_kj_per_kg_k"] = float(p.specific_heat_kj_per_kg_k)
+            if p.density_kg_m3 is not None:
+                sim_extras["wall_density_kg_m3"] = float(p.density_kg_m3)
+            if p.material is not None:
+                sim_extras["wall_material"] = str(p.material)
 
         try:
             run_physical_simulation_for_params(
@@ -314,6 +389,7 @@ def simulate_batch(req: BatchRequest) -> dict[str, Any]:
                 wind_direction=site.weather.windDirection,
                 output_dir=out_dir,
                 verbose=False,
+                **sim_extras,
             )
 
             base = f"/outputs/{sub}"

@@ -188,6 +188,66 @@ DATACENTER_SPECS: Dict[str, Any] = {
 
 
 # ============================================================
+# 2a. WALL / SLAB THERMAL OVERRIDES (volumetric heat capacity)
+# ============================================================
+
+_WALL_DEFAULT_DENSITY_KG_M3: dict[str, float] = {
+    "concrete": 2400.0,
+    "brick": 1800.0,
+    "steel": 7850.0,
+    "wood": 600.0,
+    "glass": 2500.0,
+    "granite": 2700.0,
+    "gypsum": 1200.0,
+    "stone": 2500.0,
+    "default": 2400.0,
+}
+
+
+def default_density_for_wall_material(wall_material: str | None) -> float:
+    if not wall_material:
+        return _WALL_DEFAULT_DENSITY_KG_M3["default"]
+    n = str(wall_material).lower()
+    for key, rho in _WALL_DEFAULT_DENSITY_KG_M3.items():
+        if key == "default":
+            continue
+        if key in n:
+            return rho
+    return _WALL_DEFAULT_DENSITY_KG_M3["default"]
+
+
+def volumetric_heat_capacity_J_m3K(cp_kj_kg_k: float, density_kg_m3: float) -> float:
+    return float(cp_kj_kg_k) * 1000.0 * float(density_kg_m3)
+
+
+def merge_wall_thermal_into_datacenter_specs(
+    base_specs: Dict[str, Any],
+    *,
+    wall_specific_heat_kj_per_kg_k: float,
+    wall_density_kg_m3: float | None = None,
+    wall_material: str | None = None,
+) -> Dict[str, Any]:
+    """
+    Replace ``concrete_Cv_J_m3K`` used for opaque walls + slab thermal mass in
+    ``compute_datacenter_effective_properties`` with rho*cp from the selected envelope solid.
+    """
+    specs = dict(base_specs)
+    rho = (
+        float(wall_density_kg_m3)
+        if wall_density_kg_m3 is not None
+        else default_density_for_wall_material(wall_material)
+    )
+    cv = volumetric_heat_capacity_J_m3K(wall_specific_heat_kj_per_kg_k, rho)
+    specs["concrete_Cv_J_m3K"] = cv
+    label = wall_material or "custom solid"
+    specs["building_type"] = (
+        f"{label} envelope (Cp={wall_specific_heat_kj_per_kg_k} kJ/kg·K, "
+        f"rho={rho:.0f} kg/m3 -> Cv={cv:.3e} J/m3·K)"
+    )
+    return specs
+
+
+# ============================================================
 # 3. DATACENTER GEOMETRY / ENVELOPE HELPERS
 # ============================================================
 
@@ -1756,6 +1816,10 @@ def run_physical_simulation_for_params(
     save_numpy: bool = True,
     save_metadata_json: bool = True,
     verbose: bool = False,
+    datacenter_specs: Dict[str, Any] | None = None,
+    wall_specific_heat_kj_per_kg_k: float | None = None,
+    wall_density_kg_m3: float | None = None,
+    wall_material: str | None = None,
 ) -> Dict[str, Any]:
     """
     Full pipeline:
@@ -1808,6 +1872,18 @@ def run_physical_simulation_for_params(
     if return_states is None:
         return_states = bool(save_gif)
 
+    if datacenter_specs is not None:
+        dc_specs_use = dict(datacenter_specs)
+    elif wall_specific_heat_kj_per_kg_k is not None:
+        dc_specs_use = merge_wall_thermal_into_datacenter_specs(
+            DATACENTER_SPECS,
+            wall_specific_heat_kj_per_kg_k=float(wall_specific_heat_kj_per_kg_k),
+            wall_density_kg_m3=wall_density_kg_m3,
+            wall_material=wall_material,
+        )
+    else:
+        dc_specs_use = dict(DATACENTER_SPECS)
+
     metrics, T_final, states = simulate_city_heat_one_case(
         buildings=buildings,
         central_building_mask=central_building_mask,
@@ -1817,7 +1893,7 @@ def run_physical_simulation_for_params(
         T_air=T_air,
         humidity=humidity_f,
         solar_radiation=solar_radiation,
-        datacenter_specs=DATACENTER_SPECS,
+        datacenter_specs=dc_specs_use,
         dx=dx,
         dy=dy,
         dt=dt,

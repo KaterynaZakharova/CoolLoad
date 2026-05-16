@@ -89,6 +89,12 @@ const IMAGE_PLACEHOLDERS = [
   "https://images.unsplash.com/photo-1509395176047-4a66953fd231?auto=format&fit=crop&w=900&q=80",
 ];
 
+const DEFAULT_WALL_PHYSICS = {
+  material: "Concrete (built-in)",
+  specific_heat_kj_per_kg_k: 0.88,
+  density_kg_m3: 2400,
+};
+
 const INITIAL_CENTERS = [
   {
     id: "dc-toronto",
@@ -107,6 +113,8 @@ const INITIAL_CENTERS = [
     image: IMAGE_PLACEHOLDERS[0],
     simulation: null,
     dirty: false,
+    pdfResources: null,
+    wallPhysics: { ...DEFAULT_WALL_PHYSICS },
   },
   {
     id: "dc-reykjavik",
@@ -122,9 +130,11 @@ const INITIAL_CENTERS = [
       windSpeed: 5.8,
       windDirection: "W",
     },
-    image: IMAGE_PLACEHOLDERS[4],
+    image: IMAGE_PLACEHOLDERS[2],
     simulation: null,
     dirty: false,
+    pdfResources: null,
+    wallPhysics: { ...DEFAULT_WALL_PHYSICS },
   },
 ];
 
@@ -205,7 +215,58 @@ function mockParsePdf(fileName, index) {
   };
 }
 
-const SIM_API_BASE = import.meta.env.VITE_SIM_API_BASE ?? "";
+/** Base URL for simulation API (no trailing slash). Empty = same origin; Vite dev proxies /api → 127.0.0.1:8765. */
+const SIM_API_BASE = String(import.meta.env.VITE_SIM_API_BASE ?? "")
+  .trim()
+  .replace(/\/+$/, "");
+
+function wallPhysicsOptionsForCenter(center) {
+  const opts = [
+    {
+      label: "Concrete (built-in): Cp 0.88 kJ/kg·K, ρ 2400 kg/m³",
+      value: {
+        material: "Concrete (built-in)",
+        specific_heat_kj_per_kg_k: 0.88,
+        density_kg_m3: 2400,
+      },
+    },
+  ];
+  const rows = center.pdfResources?.thermal_capacities ?? [];
+  rows.forEach((r, i) => {
+    const cp = Number(r.specific_heat_kj_per_kg_k);
+    if (!Number.isFinite(cp)) return;
+    const name = r.matched_material || r.material || `Material ${i + 1}`;
+    opts.push({
+      label: `${name}: Cp ${cp} kJ/kg·K (density from model lookup)`,
+      value: {
+        material: name,
+        specific_heat_kj_per_kg_k: cp,
+        density_kg_m3: null,
+      },
+    });
+  });
+  return opts;
+}
+
+function wallPhysicsMatches(a, b) {
+  if (!a || !b) return false;
+  return (
+    (a.material || "") === (b.material || "") &&
+    Number(a.specific_heat_kj_per_kg_k) === Number(b.specific_heat_kj_per_kg_k) &&
+    (a.density_kg_m3 ?? null) === (b.density_kg_m3 ?? null)
+  );
+}
+
+function defaultWallPhysicsFromExtract(data) {
+  const rows = data?.thermal_capacities ?? [];
+  const row = rows.find((r) => Number.isFinite(Number(r.specific_heat_kj_per_kg_k)));
+  if (!row) return null;
+  return {
+    material: row.matched_material || row.material || "From PDF",
+    specific_heat_kj_per_kg_k: Number(row.specific_heat_kj_per_kg_k),
+    density_kg_m3: null,
+  };
+}
 
 function riskFromMetrics(m) {
   const maxT = Number(m.max_temp_C);
@@ -658,7 +719,7 @@ function MinimalWorldMap({ centers, selectedId, setSelectedId }) {
   );
 }
 
-function SelectedCenterPanel({ center, onClose }) {
+function SelectedCenterPanel({ center, onClose, onWallPhysicsChange }) {
   if (!center) {
     return (
       <Card className="border-white/10 bg-white/[0.04] shadow-2xl shadow-black/30 backdrop-blur-xl">
@@ -697,6 +758,109 @@ function SelectedCenterPanel({ center, onClose }) {
         </div>
 
         <SiteImage src={center.image} label="Selected data center" />
+
+        <div className="mt-4">
+          <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Envelope material (physics)
+          </label>
+          <select
+            className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400/50"
+            value={(() => {
+              const opts = wallPhysicsOptionsForCenter(center);
+              const ix = opts.findIndex((o) =>
+                wallPhysicsMatches(o.value, center.wallPhysics)
+              );
+              return String(Math.max(0, ix));
+            })()}
+            onChange={(e) => {
+              const opts = wallPhysicsOptionsForCenter(center);
+              const sel = opts[Number(e.target.value)];
+              if (sel && onWallPhysicsChange) {
+                onWallPhysicsChange(center.id, { ...sel.value });
+              }
+            }}
+          >
+            {wallPhysicsOptionsForCenter(center).map((o, i) => (
+              <option key={i} value={String(i)}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {center.pdfResources && (
+          <div className="mt-4 space-y-3 rounded-2xl border border-white/10 bg-black/20 p-3">
+            <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+              <FileText className="h-3.5 w-3.5" />
+              PDF resources
+            </div>
+            {center.pdfResources.warnings?.length > 0 && (
+              <div className="rounded-xl border border-amber-400/20 bg-amber-500/10 p-2 text-xs text-amber-100">
+                {center.pdfResources.warnings.map((w, i) => (
+                  <div key={i}>{w}</div>
+                ))}
+              </div>
+            )}
+            <div className="grid gap-2 text-xs text-slate-300">
+              {center.pdfResources.specs?.address && (
+                <div>
+                  <span className="text-slate-500">Address: </span>
+                  {center.pdfResources.specs.address}
+                </div>
+              )}
+              {center.pdfResources.specs?.maximum_power_load_kw != null && (
+                <div>
+                  <span className="text-slate-500">Max power (doc): </span>
+                  {center.pdfResources.specs.maximum_power_load_kw} kW
+                </div>
+              )}
+              {center.pdfResources.specs?.cooling_configuration && (
+                <div>
+                  <span className="text-slate-500">Cooling: </span>
+                  {center.pdfResources.specs.cooling_configuration}
+                </div>
+              )}
+              {Array.isArray(center.pdfResources.specs?.building_materials) &&
+                center.pdfResources.specs.building_materials.length > 0 && (
+                  <div>
+                    <span className="text-slate-500">Materials: </span>
+                    {center.pdfResources.specs.building_materials.join(", ")}
+                  </div>
+                )}
+            </div>
+            {center.pdfResources.thermal_capacities?.length > 0 && (
+              <div>
+                <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                  Thermal capacities (Cp, kJ/kg·K)
+                </div>
+                <div className="max-h-40 overflow-auto rounded-lg border border-white/5 text-[11px]">
+                  <table className="w-full text-left text-slate-300">
+                    <thead className="sticky top-0 bg-slate-900/90 text-slate-500">
+                      <tr>
+                        <th className="p-2">Material</th>
+                        <th className="p-2">Cp</th>
+                        <th className="p-2">Phase</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {center.pdfResources.thermal_capacities.map((r, i) => (
+                        <tr key={i} className="border-t border-white/5">
+                          <td className="p-2">
+                            {r.matched_material || r.material || "—"}
+                          </td>
+                          <td className="p-2 font-mono">
+                            {r.specific_heat_kj_per_kg_k ?? "—"}
+                          </td>
+                          <td className="p-2">{r.phase || "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {center.dirty && (
           <div className="mt-4 flex items-center gap-2 rounded-2xl border border-orange-300/20 bg-orange-400/10 p-3 text-sm text-orange-100">
@@ -927,10 +1091,14 @@ function LoadControlPanel({
               {simulationError}
             </pre>
             <div className="mt-2 text-[11px] text-red-200/80">
-              Start the API from the repo root:{" "}
+              Start the API:{" "}
               <span className="text-white">
                 uvicorn simulation_api_server:app --host 127.0.0.1 --port 8765
               </span>
+              . With <span className="text-white">npm run dev</span>,{" "}
+              <span className="text-white">/api</span> is proxied to that port
+              (set <span className="text-white">VITE_SIM_API_BASE</span> only if
+              the API runs elsewhere).
             </div>
           </div>
         )}
@@ -1388,6 +1556,7 @@ export default function App() {
   const [optimizationProgress, setOptimizationProgress] = useState(null);
   const [lastOptimizationBundle, setLastOptimizationBundle] = useState(null);
   const [bayesianLoops, setBayesianLoops] = useState(12);
+  const [pdfUploadBusy, setPdfUploadBusy] = useState(false);
 
   const selectedCenter = centers.find((c) => c.id === selectedId) || null;
 
@@ -1427,6 +1596,8 @@ export default function App() {
       optimalLoad: parsed.baseLoad,
       simulation: null,
       dirty: false,
+      pdfResources: null,
+      wallPhysics: { ...DEFAULT_WALL_PHYSICS },
     };
 
     setCenters((prev) => [...prev, center]);
@@ -1434,6 +1605,97 @@ export default function App() {
     setUploadIndex((i) => i + 1);
     setReport(null);
     setLastOptimizationBundle(null);
+  }
+
+  function updateWallPhysics(id, wallPhysics) {
+    setCenters((prev) =>
+      prev.map((c) =>
+        c.id === id ? { ...c, wallPhysics, dirty: true, simulation: null } : c
+      )
+    );
+    setReport(null);
+    setLastOptimizationBundle(null);
+  }
+
+  async function addDataCenterFromPdf(file) {
+    if (!file) return;
+    setPdfUploadBusy(true);
+    setSimulationError(null);
+    try {
+      const url = `${SIM_API_BASE}/api/pdf-extract`;
+      console.info("[pdf-extract] POST", url, "file=", file.name, file.size, "bytes");
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch(url, {
+        method: "POST",
+        body: fd,
+      });
+      console.info("[pdf-extract] response", res.status, res.statusText);
+      const data = await res.json().catch(() => ({}));
+      console.info("[pdf-extract] body", {
+        ok: data.ok,
+        error: data.error,
+        warnings: data.warnings,
+      });
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || data.message || `HTTP ${res.status}`);
+      }
+      const specs = data.specs || {};
+      const loc = data.location || {};
+      const lat = parseFloat(loc.latitude);
+      const lon = parseFloat(loc.longitude);
+      const name =
+        specs.data_center_name ||
+        file.name.replace(/\.pdf$/i, "").replace(/[_-]/g, " ") ||
+        "Imported DC";
+      let baseLoadMw = 55;
+      if (specs.maximum_power_load_kw != null) {
+        const kw = Number(specs.maximum_power_load_kw);
+        if (Number.isFinite(kw)) {
+          baseLoadMw = clamp(kw / 1000, 5, 150);
+        }
+      }
+      const id = `dc-${Date.now()}-${uploadIndex}`;
+      const wp = defaultWallPhysicsFromExtract(data);
+      const center = {
+        id,
+        name,
+        lat: Number.isFinite(lat) ? lat : 43.6532,
+        lon: Number.isFinite(lon) ? lon : -79.3832,
+        baseLoad: baseLoadMw,
+        optimalLoad: baseLoadMw,
+        weather: {
+          temp: 22,
+          humidity: 55,
+          solar: 600,
+          windSpeed: 4,
+          windDirection: "NE",
+        },
+        image: IMAGE_PLACEHOLDERS[uploadIndex % IMAGE_PLACEHOLDERS.length],
+        simulation: null,
+        dirty: false,
+        pdfResources: {
+          specs,
+          thermal_capacities: data.thermal_capacities || [],
+          warnings: data.warnings || [],
+        },
+        wallPhysics:
+          wp || {
+            material: "Concrete (built-in)",
+            specific_heat_kj_per_kg_k: 0.88,
+            density_kg_m3: 2400,
+          },
+      };
+      setCenters((prev) => [...prev, center]);
+      setSelectedId(id);
+      setUploadIndex((i) => i + 1);
+      setReport(null);
+      setLastOptimizationBundle(null);
+    } catch (e) {
+      setSimulationError(e?.message || String(e));
+    } finally {
+      setPdfUploadBusy(false);
+    }
   }
 
   function removeCenter(id) {
@@ -1527,20 +1789,41 @@ export default function App() {
     setOptimizationProgress(null);
     setLastOptimizationBundle(null);
 
-    const sitesPayload = centers.map((center) => ({
-      id: center.id,
-      name: center.name,
-      lat: center.lat,
-      lon: center.lon,
-      base_load_mw: Number(center.baseLoad),
-      weather: {
-        temp: center.weather.temp,
-        humidity: center.weather.humidity,
-        solar: center.weather.solar,
-        windSpeed: center.weather.windSpeed,
-        windDirection: center.weather.windDirection,
-      },
-    }));
+    const sitesPayload = centers.map((center) => {
+      const row = {
+        id: center.id,
+        name: center.name,
+        lat: center.lat,
+        lon: center.lon,
+        base_load_mw: Number(center.baseLoad),
+        weather: {
+          temp: center.weather.temp,
+          humidity: center.weather.humidity,
+          solar: center.weather.solar,
+          windSpeed: center.weather.windSpeed,
+          windDirection: center.weather.windDirection,
+        },
+      };
+      const wp = center.wallPhysics;
+      if (
+        wp &&
+        wp.specific_heat_kj_per_kg_k != null &&
+        Number.isFinite(Number(wp.specific_heat_kj_per_kg_k))
+      ) {
+        const physics = {
+          material: wp.material ?? null,
+          specific_heat_kj_per_kg_k: Number(wp.specific_heat_kj_per_kg_k),
+        };
+        if (
+          wp.density_kg_m3 != null &&
+          Number.isFinite(Number(wp.density_kg_m3))
+        ) {
+          physics.density_kg_m3 = Number(wp.density_kg_m3);
+        }
+        row.physics = physics;
+      }
+      return row;
+    });
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 1_800_000);
@@ -1724,18 +2007,25 @@ export default function App() {
                 </div>
 
                 <div className="flex flex-wrap gap-3">
-                  <label className="inline-flex cursor-pointer items-center justify-center rounded-md bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300">
-                    <Upload className="mr-2 h-4 w-4" />
-                    Upload PDF spec
+                  <label
+                    className={`inline-flex cursor-pointer items-center justify-center rounded-md bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300 ${
+                      pdfUploadBusy ? "pointer-events-none opacity-70" : ""
+                    }`}
+                  >
+                    {pdfUploadBusy ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Upload className="mr-2 h-4 w-4" />
+                    )}
+                    {pdfUploadBusy ? "Extracting PDF…" : "Upload PDF spec"}
                     <input
                       type="file"
                       accept="application/pdf"
                       className="hidden"
+                      disabled={pdfUploadBusy}
                       onChange={(e) => {
                         const file = e.target.files?.[0];
-                        addMockDataCenter(
-                          file?.name || "uploaded_specification.pdf"
-                        );
+                        if (file) addDataCenterFromPdf(file);
                         e.target.value = "";
                       }}
                     />
@@ -1829,6 +2119,7 @@ export default function App() {
             <SelectedCenterPanel
               center={selectedCenter}
               onClose={() => setSelectedId(null)}
+              onWallPhysicsChange={updateWallPhysics}
             />
           </aside>
         </section>
