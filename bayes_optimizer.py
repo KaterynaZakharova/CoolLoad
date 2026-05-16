@@ -9,6 +9,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 from scipy.stats import norm
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -711,12 +712,16 @@ def slim_eval_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def slim_global_item(item: Dict[str, Any]) -> Dict[str, Any]:
     loads = item["loads_mw"]
-    return {
+    slim: Dict[str, Any] = {
         "candidate_index": int(item["candidate_index"]),
         "objective": float(item["objective"]),
         "loads_mw": loads.tolist() if isinstance(loads, np.ndarray) else list(loads),
         "sites": slim_eval_results(item["results"]),
     }
+    lz = item.get("latent_z")
+    if lz is not None:
+        slim["latent_z"] = lz.tolist() if isinstance(lz, np.ndarray) else list(lz)
+    return slim
 
 
 def collect_final_run_asset_paths(
@@ -764,12 +769,20 @@ def write_optimization_charts(
     datacenter_names: List[str],
     base_loads_mw: List[float],
     best_loads_mw: List[float],
+    random_seed: int = RANDOM_SEED,
+    best_per_site: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, str]:
     """
-    Save PNG charts next to ``report.html`` for a friendlier HTML report.
+    Save PNG charts next to ``report.html``.
 
-    Uncertainty: per-site error bars use σ(load MW) across all GP / EI evaluations,
-    not a closed-form Bayesian credible interval.
+    Includes:
+        - Objective vs evaluation step with running best (transparency on improvement).
+        - GP surrogate mean ± σ at training latents (exploration uncertainty proxy).
+        - Per-site load distribution across candidates (p10–p90 band vs best).
+        - Baseline vs optimal bars with σ across candidates.
+        - Heatmap of MW splits for the lowest-objective trials (readability).
+        - Per-site diagnostic thermal score at the optimum.
+        - Local refinement as a single before→after path chart per seed.
     """
     run_root.mkdir(parents=True, exist_ok=True)
     paths: Dict[str, str] = {}
@@ -777,89 +790,152 @@ def write_optimization_charts(
     if not global_slim:
         return paths
 
-    loads_mat = np.array([row["loads_mw"] for row in global_slim], dtype=float)
-    objs = np.array([row["objective"] for row in global_slim], dtype=float)
-    ranks = np.arange(1, len(objs) + 1)
-    order = np.argsort(objs)
-    objs_sorted = objs[order]
-    global_obj_std = float(np.std(objs)) if len(objs) > 1 else 0.0
+    base_arr = np.asarray(base_loads_mw, dtype=float).reshape(-1)
+    best_arr = np.asarray(best_loads_mw, dtype=float).reshape(-1)
+    n_sites = len(datacenter_names)
 
-    fig, ax = plt.subplots(figsize=(8.5, 4.8), facecolor="#0f172a")
+    rows_ts = sorted(global_slim, key=lambda r: int(r["candidate_index"]))
+    steps = np.array([int(r["candidate_index"]) + 1 for r in rows_ts], dtype=float)
+    objs_ts = np.array([float(r["objective"]) for r in rows_ts], dtype=float)
+    cum_best = np.minimum.accumulate(objs_ts)
+    regret = objs_ts - cum_best
+
+    loads_mat = np.array([row["loads_mw"] for row in global_slim], dtype=float)
+    load_std = np.std(loads_mat, axis=0) if loads_mat.size else np.zeros(n_sites)
+    load_p10 = np.percentile(loads_mat, 10, axis=0) if loads_mat.size else best_arr
+    load_p90 = np.percentile(loads_mat, 90, axis=0) if loads_mat.size else best_arr
+
+    def _style_dark(ax: Any) -> None:
+        ax.set_facecolor("#0f172a")
+        ax.tick_params(colors="#94a3b8")
+        for spine in ax.spines.values():
+            spine.set_color("#334155")
+
+    # --- 1) Improvement trace (objective + running best + regret band) ---
+    fig, ax = plt.subplots(figsize=(10, 5.2), facecolor="#0f172a")
     ax.set_facecolor("#0f172a")
     ax.plot(
-        ranks,
-        objs_sorted,
-        color="#38bdf8",
-        lw=2.2,
-        marker="o",
+        steps,
+        objs_ts,
+        "o-",
+        color="#94a3b8",
+        lw=1.4,
         ms=5,
-        label="Objective (sorted best → worst)",
+        label="Objective each physics eval (lower is better)",
+        alpha=0.9,
     )
-    if global_obj_std > 1e-9:
-        ax.fill_between(
-            ranks,
-            objs_sorted[0] - global_obj_std,
-            objs_sorted[0] + global_obj_std,
-            color="#38bdf8",
-            alpha=0.12,
-            label=f"Band around best ± σ_obj (σ={global_obj_std:.3f})",
-        )
-    ax.set_xlabel("Rank after sorting candidates", color="#94a3b8", fontsize=11)
-    ax.set_ylabel("Objective (lower is better)", color="#94a3b8", fontsize=11)
-    ax.tick_params(colors="#94a3b8")
-    for spine in ax.spines.values():
-        spine.set_color("#334155")
+    ax.plot(
+        steps,
+        cum_best,
+        "-",
+        color="#22d3ee",
+        lw=2.8,
+        label="Best-so-far (running minimum)",
+    )
+    ax.fill_between(
+        steps,
+        cum_best,
+        objs_ts,
+        where=(objs_ts >= cum_best),
+        color="#f97316",
+        alpha=0.18,
+        interpolate=True,
+        label="Instant regret (gap to best-so-far)",
+    )
+    ax.set_xlabel("Physics evaluation # (chronological)", color="#94a3b8", fontsize=11)
+    ax.set_ylabel("Objective", color="#94a3b8", fontsize=11)
     ax.set_title(
-        "How good were the tried load splits? (sorted curve)",
+        "Search progress: how fast did we improve?",
         color="#e2e8f0",
         fontsize=13,
         fontweight="semibold",
     )
-    leg = ax.legend(loc="lower right", facecolor="#1e293b", edgecolor="#334155", fontsize=9)
-    for text in leg.get_texts():
-        text.set_color("#e2e8f0")
+    _style_dark(ax)
+    leg = ax.legend(loc="upper right", fontsize=9, facecolor="#1e293b", edgecolor="#334155")
+    for t in leg.get_texts():
+        t.set_color("#e2e8f0")
     fig.tight_layout()
-    p1 = run_root / "chart_objectives.png"
-    fig.savefig(p1, dpi=165, facecolor=fig.get_facecolor())
+    p_trace = run_root / "chart_improvement_trace.png"
+    fig.savefig(p_trace, dpi=165, facecolor=fig.get_facecolor())
     plt.close(fig)
-    paths["objectives"] = p1.name
+    paths["improvement_trace"] = p_trace.name
 
-    load_std = np.std(loads_mat, axis=0) if loads_mat.size else np.zeros(len(datacenter_names))
-    fig, ax = plt.subplots(figsize=(8.5, 4.8), facecolor="#0f172a")
+    # --- 2) GP mean ± σ at evaluated latents (final surrogate, training-only) ---
+    Z_list = [r.get("latent_z") for r in rows_ts]
+    if (
+        Z_list
+        and all(z is not None and len(z) > 0 for z in Z_list)
+        and len(Z_list) >= 2
+    ):
+        X_train = np.array([np.asarray(z, dtype=float).reshape(-1) for z in Z_list], dtype=float)
+        y_train = objs_ts.copy()
+        gp_final = _fit_gp(X_train, y_train, random_seed)
+        if gp_final is not None:
+            mu_t, std_t = gp_final.predict(X_train, return_std=True)
+            fig, ax = plt.subplots(figsize=(10, 5.0), facecolor="#0f172a")
+            ax.set_facecolor("#0f172a")
+            ax.plot(steps, y_train, "o", color="#fbbf24", ms=6, label="Observed objective")
+            ax.plot(steps, mu_t, "-", color="#a78bfa", lw=2.2, label="GP posterior mean μ(z)")
+            ax.fill_between(
+                steps,
+                mu_t - std_t,
+                mu_t + std_t,
+                color="#a78bfa",
+                alpha=0.25,
+                label="±1σ GP uncertainty (surrogate, not physics noise)",
+            )
+            ax.set_xlabel("Evaluation #", color="#94a3b8", fontsize=11)
+            ax.set_ylabel("Objective", color="#94a3b8", fontsize=11)
+            ax.set_title(
+                "Surrogate model (GPR) vs observations — where the algorithm is uncertain",
+                color="#e2e8f0",
+                fontsize=13,
+                fontweight="semibold",
+            )
+            _style_dark(ax)
+            leg = ax.legend(loc="upper right", facecolor="#1e293b", edgecolor="#334155", fontsize=9)
+            for t in leg.get_texts():
+                t.set_color("#e2e8f0")
+            fig.tight_layout()
+            p_gp = run_root / "chart_gp_surrogate.png"
+            fig.savefig(p_gp, dpi=165, facecolor=fig.get_facecolor())
+            plt.close(fig)
+            paths["gp_surrogate"] = p_gp.name
+
+    # --- 3) Per-site MW: baseline, best, p10–p90 across candidate pool ---
+    fig, ax = plt.subplots(figsize=(max(9.0, 1.2 * n_sites), 5.0), facecolor="#0f172a")
     ax.set_facecolor("#0f172a")
-    x_pos = np.arange(len(datacenter_names))
-    w = 0.36
-    ax.bar(
-        x_pos - w / 2,
-        base_loads_mw,
-        w,
-        label="Baseline MW",
-        color="#475569",
-        edgecolor="#64748b",
-    )
-    ax.bar(
-        x_pos + w / 2,
-        best_loads_mw,
-        w,
-        yerr=load_std,
-        capsize=5,
-        label="Optimized MW",
-        color="#22d3ee",
-        edgecolor="#0891b2",
-        ecolor="#fca5a5",
-        error_kw={"linewidth": 1.5},
+    x_pos = np.arange(n_sites)
+    w = 0.28
+    ax.bar(x_pos - w, base_arr, w, label="Baseline MW", color="#475569", edgecolor="#64748b")
+    ax.bar(x_pos, best_arr, w, label="Optimized MW", color="#22d3ee", edgecolor="#0891b2")
+    ax.errorbar(
+        x_pos,
+        best_arr,
+        yerr=[np.maximum(0, best_arr - load_p10), np.maximum(0, load_p90 - best_arr)],
+        fmt="none",
+        ecolor="#fb923c",
+        capsize=4,
+        elinewidth=1.5,
+        label="p10–p90 MW across evaluated splits (at optimal x)",
     )
     ax.set_xticks(x_pos)
-    ax.set_xticklabels([n[:20] + ("…" if len(n) > 20 else "") for n in datacenter_names], rotation=22, ha="right", color="#94a3b8", fontsize=9)
+    ax.set_xticklabels(
+        [n[:18] + ("…" if len(n) > 18 else "") for n in datacenter_names],
+        rotation=28,
+        ha="right",
+        color="#94a3b8",
+        fontsize=9,
+    )
     ax.set_ylabel("MW", color="#94a3b8", fontsize=11)
-    ax.tick_params(colors="#94a3b8")
     ax.set_title(
-        "Best allocation vs baseline (error bars = σ across candidate pool)",
+        "Load allocation: baseline vs optimal vs cross-candidate spread",
         color="#e2e8f0",
         fontsize=13,
         fontweight="semibold",
     )
-    leg = ax.legend(facecolor="#1e293b", edgecolor="#334155")
+    _style_dark(ax)
+    leg = ax.legend(loc="upper left", facecolor="#1e293b", edgecolor="#334155", fontsize=9)
     for t in leg.get_texts():
         t.set_color("#e2e8f0")
     fig.tight_layout()
@@ -868,25 +944,145 @@ def write_optimization_charts(
     plt.close(fig)
     paths["loads"] = p2.name
 
+    # --- 4) Heatmap: MW split for lowest-objective trials (which site got load?) ---
+    rows_by_obj = sorted(global_slim, key=lambda r: float(r["objective"]))
+    n_hm = min(24, len(rows_by_obj))
+    if n_hm >= 1 and n_sites >= 1:
+        hm_rows = rows_by_obj[:n_hm]
+        mat = np.array([list(map(float, r["loads_mw"])) for r in hm_rows], dtype=float)
+        fig_h, ax_h = plt.subplots(figsize=(max(8.0, 0.55 * n_sites + 3.0), max(4.5, 0.32 * n_hm + 2.2)), facecolor="#0f172a")
+        ax_h.set_facecolor("#0f172a")
+        im_h = ax_h.imshow(mat, aspect="auto", cmap="magma", interpolation="nearest")
+        cb = fig_h.colorbar(im_h, ax=ax_h, fraction=0.046, pad=0.04)
+        cb.ax.yaxis.set_tick_params(color="#94a3b8")
+        cb.set_label("MW at site", color="#94a3b8", fontsize=10)
+        plt.setp(cb.ax.get_yticklabels(), color="#94a3b8")
+        ax_h.set_xticks(np.arange(n_sites))
+        ax_h.set_xticklabels(
+            [n[:14] + ("…" if len(n) > 14 else "") for n in datacenter_names],
+            rotation=35,
+            ha="right",
+            color="#94a3b8",
+            fontsize=9,
+        )
+        y_labs = [
+            f"#{int(r['candidate_index']) + 1}  obj={float(r['objective']):.3f}"
+            for r in hm_rows
+        ]
+        ax_h.set_yticks(np.arange(n_hm))
+        ax_h.set_yticklabels(y_labs, fontsize=8, color="#94a3b8")
+        ax_h.set_title(
+            "Load splits for the lowest-objective trials (rows ordered best → worse in this window)",
+            color="#e2e8f0",
+            fontsize=12,
+            fontweight="semibold",
+        )
+        _style_dark(ax_h)
+        fig_h.tight_layout()
+        p_hm = run_root / "chart_load_heatmap.png"
+        fig_h.savefig(p_hm, dpi=165, facecolor=fig_h.get_facecolor())
+        plt.close(fig_h)
+        paths["load_heatmap"] = p_hm.name
+
+    # --- 5) ΔMW per site (improvement direction) ---
+    delta = best_arr - base_arr
+    fig, ax = plt.subplots(figsize=(max(8.0, 1.0 * n_sites), 4.4), facecolor="#0f172a")
+    ax.set_facecolor("#0f172a")
+    colors = ["#34d399" if d >= 0 else "#f87171" for d in delta]
+    ax.bar(x_pos, delta, color=colors, edgecolor="#334155")
+    ax.axhline(0, color="#94a3b8", lw=1)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(
+        [n[:18] + ("…" if len(n) > 18 else "") for n in datacenter_names],
+        rotation=28,
+        ha="right",
+        color="#94a3b8",
+        fontsize=9,
+    )
+    ax.set_ylabel("Δ MW (optimal − baseline)", color="#94a3b8", fontsize=11)
+    ax.set_title("Extra load absorbed per site at optimum", color="#e2e8f0", fontsize=13, fontweight="semibold")
+    _style_dark(ax)
+    fig.tight_layout()
+    p_delta = run_root / "chart_delta_mw.png"
+    fig.savefig(p_delta, dpi=165, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    paths["delta_mw"] = p_delta.name
+
+    # --- 6) Per-site diagnostic score at optimum (same formula as site_objective in JSON) ---
+    if best_per_site and len(best_per_site) == n_sites and n_sites > 0:
+        site_obj = [float(r.get("site_objective", 0.0)) for r in best_per_site]
+        fig_s, ax_s = plt.subplots(figsize=(max(8.0, 0.45 * n_sites + 4.0), 4.8), facecolor="#0f172a")
+        ax_s.set_facecolor("#0f172a")
+        y_pos = np.arange(n_sites)
+        ax_s.barh(y_pos, site_obj, color="#38bdf8", edgecolor="#0891b2", height=0.65)
+        ax_s.set_yticks(y_pos)
+        ax_s.set_yticklabels(
+            [n[:22] + ("…" if len(n) > 22 else "") for n in datacenter_names],
+            color="#94a3b8",
+            fontsize=9,
+        )
+        ax_s.invert_yaxis()
+        ax_s.set_xlabel(
+            "Per-site diagnostic thermal score (lower = calmer site; not equal to global objective)",
+            color="#94a3b8",
+            fontsize=10,
+        )
+        ax_s.set_title(
+            "Thermal stress by site at the chosen optimum",
+            color="#e2e8f0",
+            fontsize=13,
+            fontweight="semibold",
+        )
+        _style_dark(ax_s)
+        fig_s.tight_layout()
+        p_site = run_root / "chart_site_scores.png"
+        fig_s.savefig(p_site, dpi=165, facecolor=fig_s.get_facecolor())
+        plt.close(fig_s)
+        paths["site_scores"] = p_site.name
+
+    # --- 7) Local refinement: one before→after connector per seed ---
     if refined_slim:
-        fig, ax = plt.subplots(figsize=(8.5, 4.2), facecolor="#0f172a")
+        fig, ax = plt.subplots(figsize=(9.0, max(3.8, 0.55 * len(refined_slim))), facecolor="#0f172a")
         ax.set_facecolor("#0f172a")
-        labels = [f"Seed rank {int(r['initial_rank'])}" for r in refined_slim]
         before = [float(r["initial_objective"]) for r in refined_slim]
         after = [float(r["objective"]) for r in refined_slim]
-        x = np.arange(len(labels))
-        ax.bar(x - 0.2, before, 0.4, label="Before local refine", color="#64748b", edgecolor="#475569")
-        ax.bar(x + 0.2, after, 0.4, label="After local refine", color="#34d399", edgecolor="#059669")
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, color="#94a3b8", fontsize=10)
-        ax.set_ylabel("Objective", color="#94a3b8", fontsize=11)
-        ax.tick_params(colors="#94a3b8")
-        ax.set_title("Local coordinate refinement", color="#e2e8f0", fontsize=13, fontweight="semibold")
-        leg = ax.legend(facecolor="#1e293b", edgecolor="#334155")
+        y = np.arange(len(refined_slim), dtype=float)
+        for i, yi in enumerate(y):
+            b, a = before[i], after[i]
+            ax.plot([b, a], [yi, yi], "-", color="#475569", lw=2.4, zorder=1)
+            ax.scatter([b], [yi], s=96, c="#94a3b8", edgecolors="#e2e8f0", linewidths=0.6, zorder=3)
+            ax.scatter([a], [yi], s=110, c="#34d399", edgecolors="#059669", linewidths=0.6, zorder=4)
+            if a < b - 1e-9:
+                ax.annotate(
+                    f"Δ {a - b:.3f}",
+                    xy=(a, yi),
+                    xytext=(6, 0),
+                    textcoords="offset points",
+                    fontsize=8,
+                    color="#6ee7b7",
+                    va="center",
+                )
+        ax.set_yticks(y)
+        ax.set_yticklabels(
+            [f"Seed (GP rank {int(r['initial_rank']) + 1})" for r in refined_slim],
+            color="#94a3b8",
+            fontsize=10,
+        )
+        ax.set_xlabel("Objective (lower is better)", color="#94a3b8", fontsize=11)
+        ax.set_title(
+            "Local coordinate refinement: gray = before, green = after",
+            color="#e2e8f0",
+            fontsize=13,
+            fontweight="semibold",
+        )
+        leg_el = [
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#94a3b8", markersize=9, label="Before refine"),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#34d399", markersize=10, label="After refine"),
+        ]
+        leg = ax.legend(handles=leg_el, loc="lower right", facecolor="#1e293b", edgecolor="#334155")
         for t in leg.get_texts():
             t.set_color("#e2e8f0")
-        for spine in ax.spines.values():
-            spine.set_color("#334155")
+        _style_dark(ax)
         fig.tight_layout()
         p3 = run_root / "chart_refinement.png"
         fig.savefig(p3, dpi=165, facecolor=fig.get_facecolor())
@@ -909,8 +1105,9 @@ def build_html_report(
     best_per_site: List[Dict[str, Any]],
     asset_rows: List[Dict[str, str]],
     chart_paths: Dict[str, str],
+    narrative_html: Optional[str] = None,
 ) -> str:
-    """HTML report with embedded charts (paths relative to ``run_root``)."""
+    """HTML report with chart and gallery URLs rooted at ``/opt-out/{run_id}/`` for HTTP serving."""
 
     def row_cells(vals: List[str]) -> str:
         return "".join(f"<td>{escape(str(v))}</td>" for v in vals)
@@ -961,10 +1158,18 @@ def build_html_report(
         )
         best_body += "</tr>"
 
+    def pub_url(rel: str) -> str:
+        if not rel:
+            return ""
+        r = rel.replace("\\", "/").lstrip("./")
+        if r.startswith("/opt-out/") or r.startswith("http://") or r.startswith("https://"):
+            return r
+        return f"/opt-out/{run_id}/{r}".replace("//", "/")
+
     def img_block(rel: str, caption: str) -> str:
         if not rel:
             return ""
-        u = rel.replace("\\", "/")
+        u = pub_url(rel)
         return (
             f"<figure class='chart'><figcaption>{escape(caption)}</figcaption>"
             f"<img src='{escape(u)}' alt='{escape(caption)}'/></figure>"
@@ -972,17 +1177,29 @@ def build_html_report(
 
     charts_html = "<div class='charts'>"
     charts_html += "<h2>Optimization at a glance</h2>"
-    charts_html += "<p class='lead'>Curves summarize every load split we simulated during the search. "
-    charts_html += "Error bars on the allocation chart show how much each site’s MW moved across random candidates (exploration spread), not a formal Bayesian credible interval.</p>"
+    charts_html += f"<p class='lead'>Figure URLs use <code>/opt-out/{escape(run_id)}/…</code> so they resolve when this report is served from the API (or any reverse proxy that maps that prefix). "
+    charts_html += "Chronological panels show each expensive physics evaluation; orange regret bands show how far a point was from the running best. "
+    charts_html += "The GP chart is a <em>surrogate</em> on latent load codes (±1σ there is model uncertainty in z-space, not a full simulator credible interval). "
+    charts_html += "The heatmap contrasts <strong>which sites received MW</strong> in the best-scoring trials.</p>"
     charts_html += "<div class='chart-row'>"
-    charts_html += img_block(chart_paths.get("objectives", ""), "Objective landscape (sorted)")
-    charts_html += img_block(chart_paths.get("loads", ""), "Baseline vs optimal MW")
-    charts_html += "</div>"
-    if chart_paths.get("refinement"):
-        charts_html += "<div class='chart-row'>"
-        charts_html += img_block(chart_paths["refinement"], "Local refinement")
-        charts_html += "</div>"
-    charts_html += "</div>"
+    charts_html += img_block(chart_paths.get("improvement_trace", ""), "Objective vs evaluation # (running best + regret)")
+    charts_html += img_block(chart_paths.get("gp_surrogate", ""), "GPR surrogate vs observations (mean ± σ)")
+    charts_html += "</div><div class='chart-row'>"
+    charts_html += img_block(chart_paths.get("loads", ""), "Baseline vs optimal MW + cross-candidate spread")
+    charts_html += img_block(chart_paths.get("load_heatmap", ""), "MW split heatmap for lowest-objective trials")
+    charts_html += "</div><div class='chart-row'>"
+    charts_html += img_block(chart_paths.get("delta_mw", ""), "Δ MW per site (optimal − baseline)")
+    charts_html += img_block(chart_paths.get("site_scores", ""), "Per-site diagnostic thermal score at optimum")
+    charts_html += "</div><div class='chart-row'>"
+    charts_html += img_block(chart_paths.get("refinement", ""), "Local refinement: objective before vs after coordinate polish")
+    charts_html += "</div></div>"
+
+    narrative_section = ""
+    if narrative_html:
+        narrative_section = (
+            "<section class='narrative-wrap'><h2>Run narrative</h2>"
+            f"{narrative_html}</section>"
+        )
 
     gallery = "<section><h2>Physical simulation — best run</h2><p class='lead'>Heat fields from the full-resolution rerun at the optimal MW values.</p>"
     for ar in asset_rows:
@@ -995,16 +1212,16 @@ def build_html_report(
         ]:
             if not rel:
                 continue
-            url = rel.replace("\\", "/")
+            url = pub_url(rel)
             gallery += (
                 f"<figure class='thumb'><figcaption>{escape(label)}</figcaption>"
                 f"<a href='{escape(url)}' target='_blank' rel='noopener'>"
                 f"<img loading='lazy' src='{escape(url)}' alt='{escape(label)}'/></a></figure>"
             )
         if ar.get("gif"):
-            gurl = str(ar["gif"]).replace("\\", "/")
+            gurl = pub_url(str(ar["gif"]))
             gallery += (
-                f"<figure class='thumb'><figcaption>Heat plume GIF</figcaption>"
+                f"<figure class='thumb'><figcaption>Heat plume GIF (wind arrow = advection direction)</figcaption>"
                 f"<img src='{escape(gurl)}' alt='gif'/></figure>"
             )
         gallery += "</div>"
@@ -1035,15 +1252,21 @@ figure.thumb img {{ max-width:100%; height:auto; border-radius:8px; display:bloc
 figcaption {{ font-size:12px; color:var(--muted); margin-bottom:8px; }}
 .grid {{ display:flex; flex-wrap:wrap; gap:14px; }}
 section {{ max-width:1100px; margin:0 auto; }}
-code {{ background:#020617; padding:2px 8px; border-radius:6px; font-size:0.88em; }}
+.narrative-wrap {{ max-width:1100px; margin:0 auto 28px; padding:20px 24px; background:var(--card); border-radius:16px; border:1px solid var(--line); }}
+.narrative-wrap h3 {{ color:#a5f3fc; margin:1.1em 0 0.4em; font-size:1.02rem; }}
+.narrative-wrap p {{ margin:0.55em 0; color:var(--txt); }}
+.narrative-wrap ul {{ margin:0.4em 0 0.6em 1.2em; color:#cbd5e1; }}
+.narrative-wrap li {{ margin:0.25em 0; }}
+.narrative-wrap code {{ font-size:0.88em; }}
 </style></head><body>
 <header>
 <h1>Thermal load optimization report</h1>
-<p class="lead">This run placed <strong>{extra_total_mw:.2f} MW</strong> of extra IT load across your sites. Lower objective is better (sum over sites of central ΔT + mean ΔT vs ambient, plus weighted mean absolute temperature). Run id: <code>{escape(run_id)}</code></p>
+<p class="lead">This run placed <strong>{extra_total_mw:.2f} MW</strong> of extra IT load across your sites. <strong>Lower objective is better.</strong> The scalar being minimized blends worst-site thermal rise (smooth max), imbalance of rises across sites, summed anomalies, hot-area footprint, and a mild worst absolute-temperature term (see <code>compute_total_objective</code> in the optimizer). Run id: <code>{escape(run_id)}</code></p>
 <p class="lead">Best objective after full physics rerun: <strong>{best_objective:.4f}</strong></p>
 </header>
 <section>
 {charts_html}
+{narrative_section}
 <h2>All candidates evaluated (GP search + EI)</h2>
 <p class="lead">Every row is one simulated load split from Gaussian-process Bayesian optimization (expected improvement). The best seeds are refined locally.</p>
 <table><thead>{g_head}</thead><tbody>{g_body}</tbody></table>
@@ -1072,11 +1295,14 @@ def write_optimization_report_bundle(
     best_objective: float,
     best_results: List[Dict[str, Any]],
     final_asset_rel: List[Dict[str, str]],
+    *,
+    optimizer_meta: Optional[Dict[str, Any]] = None,
+    random_seed: int = RANDOM_SEED,
 ) -> Tuple[Path, Path, Dict[str, str]]:
     run_root.mkdir(parents=True, exist_ok=True)
     names = [str(dc.get("name", f"site_{i}")) for i, dc in enumerate(datacenters)]
     best_per = slim_eval_results(best_results)
-    optimal_payload = {
+    optimal_payload: Dict[str, Any] = {
         "run_id": run_id,
         "extra_total_load_mw": float(extra_total_load_mw),
         "base_loads_mw": base_loads_mw.tolist(),
@@ -1086,6 +1312,9 @@ def write_optimization_report_bundle(
         "refinement": refined_slim,
         "best_per_site": best_per,
     }
+    if optimizer_meta:
+        optimal_payload.update(optimizer_meta)
+
     chart_paths = write_optimization_charts(
         run_root=run_root,
         global_slim=global_slim,
@@ -1093,8 +1322,24 @@ def write_optimization_report_bundle(
         datacenter_names=names,
         base_loads_mw=base_loads_mw.tolist(),
         best_loads_mw=best_loads_mw.tolist(),
+        random_seed=random_seed,
+        best_per_site=best_per,
     )
     optimal_payload["charts"] = chart_paths
+
+    try:
+        from optimization_report_narrator import generate_optimization_narrative_html
+
+        narrative_html = generate_optimization_narrative_html(
+            datacenters,
+            optimal_payload,
+            run_root=run_root,
+        )
+    except Exception as exc:
+        narrative_html = (
+            "<p><em>Narrative module unavailable: "
+            f"{escape(str(exc))}</em></p>"
+        )
 
     json_path = run_root / "optimal_data.json"
     with open(json_path, "w", encoding="utf-8") as f:
@@ -1112,6 +1357,7 @@ def write_optimization_report_bundle(
         best_per_site=best_per,
         asset_rows=final_asset_rel,
         chart_paths=chart_paths,
+        narrative_html=narrative_html,
     )
     html_path = run_root / "report.html"
     with open(html_path, "w", encoding="utf-8") as f:
@@ -1287,6 +1533,7 @@ def optimize_datacenter_loads_iter(
             "loads_mw": loads.copy(),
             "objective": float(obj),
             "results": results,
+            "latent_z": z.astype(float).copy(),
         }
         global_history.append(item)
 
@@ -1381,6 +1628,7 @@ def optimize_datacenter_loads_iter(
         "bo_init_evals": int(n_init),
         "bo_ei_evals": int(n_bo),
         "bo_latent_dim": int(d_latent),
+        "random_seed": int(random_seed),
     }
 
     yield {"type": "complete", "result": result}

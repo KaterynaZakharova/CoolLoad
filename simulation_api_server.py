@@ -284,6 +284,20 @@ def _optimize_stream(req: OptimizeRequest) -> Iterator[bytes]:
                     best_objective=obj_final,
                     best_results=final_results,
                     final_asset_rel=assets,
+                    optimizer_meta={
+                        k: full[k]
+                        for k in (
+                            "optimization_method",
+                            "bo_init_evals",
+                            "bo_ei_evals",
+                            "bo_latent_dim",
+                            "target_total_mw",
+                            "cache_size",
+                            "random_seed",
+                        )
+                        if k in full
+                    },
+                    random_seed=int(full.get("random_seed", 42)),
                 )
 
                 scratch = OPT_OUTPUT_ROOT / run_id / "_scratch_eval"

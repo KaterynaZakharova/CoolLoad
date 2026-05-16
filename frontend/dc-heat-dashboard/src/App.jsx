@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Upload,
@@ -1287,6 +1287,45 @@ function ReportModal({ report, onClose, apiBase = "" }) {
   const chartSrc = (key) =>
     chartUrls[key] ? `${apiBase}${chartUrls[key]}` : null;
   const runId = opt.runId || opt.run_id;
+  const reportHtmlUrl = opt.reportHtmlUrl || opt.report_html_url || "";
+  const [panelTab, setPanelTab] = useState(
+    () => (reportHtmlUrl ? "full" : "summary")
+  );
+
+  useEffect(() => {
+    setPanelTab(reportHtmlUrl ? "full" : "summary");
+  }, [report.generatedAt, reportHtmlUrl]);
+
+  const CHART_ORDER = [
+    "improvement_trace",
+    "gp_surrogate",
+    "loads",
+    "load_heatmap",
+    "delta_mw",
+    "site_scores",
+    "refinement",
+  ];
+  const CHART_LABELS = {
+    improvement_trace: "Search progress (objective vs eval #)",
+    gp_surrogate: "GP surrogate vs observations (±σ)",
+    loads: "MW allocation (baseline, optimal, spread)",
+    load_heatmap: "Best trials: MW split heatmap",
+    delta_mw: "Δ MW per site (optimal − baseline)",
+    site_scores: "Per-site diagnostic score at optimum",
+    refinement: "Local refinement (before → after)",
+  };
+  const chartKeys = [
+    ...CHART_ORDER.filter((k) => chartUrls[k]),
+    ...Object.keys(chartUrls).filter(
+      (k) => !CHART_ORDER.includes(k) && chartUrls[k]
+    ),
+  ];
+
+  const fullReportSrc =
+    reportHtmlUrl &&
+    (reportHtmlUrl.startsWith("http")
+      ? reportHtmlUrl
+      : `${apiBase}${reportHtmlUrl}`);
 
   return (
     <motion.div
@@ -1302,17 +1341,17 @@ function ReportModal({ report, onClose, apiBase = "" }) {
       <motion.div
         role="dialog"
         aria-modal="true"
-        className="max-h-[90vh] w-full max-w-5xl overflow-hidden rounded-3xl border border-white/10 bg-slate-950 shadow-2xl shadow-black/50"
+        className="flex max-h-[92vh] w-full max-w-[min(1240px,98vw)] flex-col overflow-hidden rounded-3xl border border-white/10 bg-slate-950 shadow-2xl shadow-black/50"
         initial={{ y: 24, opacity: 0, scale: 0.98 }}
         animate={{ y: 0, opacity: 1, scale: 1 }}
         exit={{ y: 24, opacity: 0, scale: 0.98 }}
         transition={{ type: "spring", damping: 28, stiffness: 320 }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
-          <div>
+        <div className="flex flex-col gap-3 border-b border-white/10 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
             <div className="flex items-center gap-2 text-xl font-bold text-white">
-              <BarChart3 className="h-5 w-5 text-cyan-300" />
+              <BarChart3 className="h-5 w-5 shrink-0 text-cyan-300" />
               Simulation report
             </div>
             <div className="mt-1 text-xs text-slate-500">
@@ -1321,6 +1360,32 @@ function ReportModal({ report, onClose, apiBase = "" }) {
           </div>
 
           <div className="flex flex-wrap items-center justify-end gap-2">
+            {reportHtmlUrl ? (
+              <div className="mr-auto flex rounded-lg border border-white/10 bg-black/35 p-0.5 sm:mr-0">
+                <button
+                  type="button"
+                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                    panelTab === "full"
+                      ? "bg-cyan-500/25 text-cyan-100"
+                      : "text-slate-400 hover:text-white"
+                  }`}
+                  onClick={() => setPanelTab("full")}
+                >
+                  Full HTML report
+                </button>
+                <button
+                  type="button"
+                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                    panelTab === "summary"
+                      ? "bg-cyan-500/25 text-cyan-100"
+                      : "text-slate-400 hover:text-white"
+                  }`}
+                  onClick={() => setPanelTab("summary")}
+                >
+                  Summary panel
+                </button>
+              </div>
+            ) : null}
             <Button
               type="button"
               variant="outline"
@@ -1336,204 +1401,212 @@ function ReportModal({ report, onClose, apiBase = "" }) {
           </div>
         </div>
 
-        <div className="max-h-[calc(90vh-5rem)] overflow-y-auto p-5">
-          <div className="mb-6 grid grid-cols-1 gap-3 md:grid-cols-3">
-            <Metric
-              icon={Zap}
-              label="New load to place"
-              value={report.newLoadToRedistributeMW}
-              unit="MW"
-            />
-            <Metric
-              icon={Cpu}
-              label="Total base"
-              value={report.totalBaseLoadMW}
-              unit="MW"
-            />
-            <Metric
-              icon={Activity}
-              label="Total optimal"
-              value={report.totalOptimalLoadMW}
-              unit="MW"
-            />
-          </div>
-
-          {runId && (
-            <div className="mb-8 rounded-2xl border border-cyan-500/20 bg-cyan-500/5 p-5">
-              <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-cyan-200">
-                Optimization run
-              </h3>
-              <p className="mb-4 text-xs text-slate-400">
-                Run <span className="font-mono text-cyan-300">{runId}</span>
-                {(opt.bayesianLoopCount ?? opt.bayesian_loop_count) != null && (
-                  <>
-                    {" "}
-                    · {opt.bayesianLoopCount ?? opt.bayesian_loop_count} global
-                    candidates
-                  </>
-                )}
-                {(opt.topKRefine ?? opt.top_k_refine) != null && (
-                  <> · top {opt.topKRefine ?? opt.top_k_refine} refined</>
-                )}
-                {opt.bestObjective != null && (
-                  <>
-                    {" "}
-                    · best objective (full physics){" "}
-                    <span className="text-white">
-                      {Number(opt.bestObjective ?? opt.best_objective).toFixed(4)}
-                    </span>
-                  </>
-                )}
-              </p>
-              <div className="grid gap-4 md:grid-cols-2">
-                {chartSrc("objectives") && (
-                  <div className="overflow-hidden rounded-xl border border-white/10 bg-black/30">
-                    <div className="px-3 py-2 text-[11px] font-medium text-slate-400">
-                      Objectives tried (sorted)
-                    </div>
-                    <img
-                      src={chartSrc("objectives")}
-                      alt="Objective curve"
-                      className="w-full"
-                    />
-                  </div>
-                )}
-                {chartSrc("loads") && (
-                  <div className="overflow-hidden rounded-xl border border-white/10 bg-black/30">
-                    <div className="px-3 py-2 text-[11px] font-medium text-slate-400">
-                      MW allocation (bars ± σ across candidates)
-                    </div>
-                    <img
-                      src={chartSrc("loads")}
-                      alt="Load allocation"
-                      className="w-full"
-                    />
-                  </div>
-                )}
-                {chartSrc("refinement") && (
-                  <div className="overflow-hidden rounded-xl border border-white/10 bg-black/30 md:col-span-2">
-                    <div className="px-3 py-2 text-[11px] font-medium text-slate-400">
-                      Local refinement
-                    </div>
-                    <img
-                      src={chartSrc("refinement")}
-                      alt="Refinement"
-                      className="max-h-80 w-full object-contain"
-                    />
-                  </div>
-                )}
-              </div>
+        {panelTab === "full" && fullReportSrc ? (
+          <iframe
+            title="Optimization HTML report"
+            src={fullReportSrc}
+            className="h-[min(82vh,920px)] w-full flex-1 border-0 bg-[#0b1220]"
+          />
+        ) : (
+          <div className="max-h-[calc(92vh-5.5rem)] flex-1 overflow-y-auto p-5">
+            <div className="mb-6 grid grid-cols-1 gap-3 md:grid-cols-3">
+              <Metric
+                icon={Zap}
+                label="New load to place"
+                value={report.newLoadToRedistributeMW}
+                unit="MW"
+              />
+              <Metric
+                icon={Cpu}
+                label="Total base"
+                value={report.totalBaseLoadMW}
+                unit="MW"
+              />
+              <Metric
+                icon={Activity}
+                label="Total optimal"
+                value={report.totalOptimalLoadMW}
+                unit="MW"
+              />
             </div>
-          )}
 
-          <h3 className="mb-3 text-sm font-semibold text-slate-300">Sites</h3>
-          <div className="space-y-4">
-            {report.centers.map((center) => (
-              <div
-                key={center.id}
-                className="rounded-2xl border border-white/10 bg-white/[0.04] p-4"
-              >
-                <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
-                  <div>
-                    <div className="font-semibold text-white">{center.name}</div>
-                    <div className="text-xs text-slate-500">
-                      {center.location.lat.toFixed(3)},{" "}
-                      {center.location.lon.toFixed(3)}
-                    </div>
-                  </div>
-                  <div
-                    className={`rounded-full px-3 py-1 text-xs ${
-                      center.simulation?.risk === "High"
-                        ? "bg-red-500/15 text-red-200"
-                        : center.simulation?.risk === "Medium"
-                        ? "bg-orange-500/15 text-orange-200"
-                        : "bg-emerald-500/15 text-emerald-200"
-                    }`}
-                  >
-                    {center.simulation?.risk || "Not run"}
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-2 text-xs md:grid-cols-5">
-                  <div className="rounded-xl bg-black/25 p-2">
-                    <div className="text-slate-500">Base</div>
-                    <div className="font-bold text-white">{center.baseLoadMW} MW</div>
-                  </div>
-                  <div className="rounded-xl bg-black/25 p-2">
-                    <div className="text-slate-500">Optimal</div>
-                    <div className="font-bold text-orange-200">
-                      {center.optimalLoadMW} MW
-                    </div>
-                  </div>
-                  <div className="rounded-xl bg-black/25 p-2">
-                    <div className="text-slate-500">ΔT</div>
-                    <div className="font-bold text-white">
-                      {center.simulation?.deltaT ?? "—"} °C
-                    </div>
-                  </div>
-                  <div className="rounded-xl bg-black/25 p-2">
-                    <div className="text-slate-500">Max temp</div>
-                    <div className="font-bold text-white">
-                      {center.simulation?.maxTemp ?? "—"} °C
-                    </div>
-                  </div>
-                  <div className="rounded-xl bg-black/25 p-2">
-                    <div className="text-slate-500">Extra</div>
-                    <div className="font-bold text-cyan-200">
-                      {center.simulation?.assignedExtra ?? "—"} MW
-                    </div>
-                  </div>
-                </div>
-
-                {center.simulation?.assets && !center.simulation?.error && (
-                  <div className="mt-4 grid grid-cols-2 gap-2 md:grid-cols-4">
-                    {["masks", "final", "anomaly"].map((k) => {
-                      const u = center.simulation.assets[k];
-                      if (!u) return null;
-                      const src = u.startsWith("http") ? u : `${apiBase}${u}`;
-                      return (
-                        <a
-                          key={k}
-                          href={src}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="block overflow-hidden rounded-xl border border-white/10 bg-black/40"
-                        >
-                          <img
-                            src={src}
-                            alt={k}
-                            className="h-24 w-full object-cover"
-                          />
-                          <div className="px-2 py-1 text-[10px] capitalize text-slate-400">
-                            {k === "final" ? "Final T" : k}
-                          </div>
-                        </a>
-                      );
-                    })}
-                    {center.simulation.assets.gif && (
-                      <div className="col-span-2 overflow-hidden rounded-xl border border-white/10 bg-black/40 md:col-span-4">
-                        <div className="px-2 py-1 text-[10px] text-slate-400">Heat GIF</div>
+            {runId && chartKeys.length > 0 && (
+              <div className="mb-8 rounded-2xl border border-cyan-500/20 bg-cyan-500/5 p-5">
+                <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-cyan-200">
+                  Optimization charts
+                </h3>
+                <p className="mb-4 text-xs text-slate-400">
+                  Run <span className="font-mono text-cyan-300">{runId}</span>
+                  {(opt.bayesianLoopCount ?? opt.bayesian_loop_count) != null && (
+                    <>
+                      {" "}
+                      · {opt.bayesianLoopCount ?? opt.bayesian_loop_count} global
+                      candidates
+                    </>
+                  )}
+                  {(opt.topKRefine ?? opt.top_k_refine) != null && (
+                    <> · top {opt.topKRefine ?? opt.top_k_refine} refined</>
+                  )}
+                  {opt.bestObjective != null && (
+                    <>
+                      {" "}
+                      · best objective (full physics){" "}
+                      <span className="text-white">
+                        {Number(
+                          opt.bestObjective ?? opt.best_objective
+                        ).toFixed(4)}
+                      </span>
+                    </>
+                  )}
+                </p>
+                <div className="grid gap-4 md:grid-cols-2">
+                  {chartKeys.map((key) => {
+                    const src = chartSrc(key);
+                    if (!src) return null;
+                    const label =
+                      CHART_LABELS[key] ||
+                      key.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+                    const wide =
+                      key === "refinement" ||
+                      key === "improvement_trace" ||
+                      key === "gp_surrogate";
+                    return (
+                      <div
+                        key={key}
+                        className={`overflow-hidden rounded-xl border border-white/10 bg-black/30 ${
+                          wide ? "md:col-span-2" : ""
+                        }`}
+                      >
+                        <div className="px-3 py-2 text-[11px] font-medium text-slate-400">
+                          {label}
+                        </div>
                         <img
-                          src={
-                            center.simulation.assets.gif.startsWith("http")
-                              ? center.simulation.assets.gif
-                              : `${apiBase}${center.simulation.assets.gif}`
+                          src={src}
+                          alt={label}
+                          className={
+                            wide
+                              ? "max-h-96 w-full object-contain"
+                              : "w-full object-contain"
                           }
-                          alt="gif"
-                          className="max-h-48 w-full object-contain"
                         />
                       </div>
-                    )}
-                  </div>
-                )}
-
-                <div className="mt-2 text-xs text-slate-500">
-                  {center.simulation?.status || "—"}
+                    );
+                  })}
                 </div>
               </div>
-            ))}
+            )}
+
+            <h3 className="mb-3 text-sm font-semibold text-slate-300">Sites</h3>
+            <div className="space-y-4">
+              {report.centers.map((center) => (
+                <div
+                  key={center.id}
+                  className="rounded-2xl border border-white/10 bg-white/[0.04] p-4"
+                >
+                  <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <div className="font-semibold text-white">{center.name}</div>
+                      <div className="text-xs text-slate-500">
+                        {center.location.lat.toFixed(3)},{" "}
+                        {center.location.lon.toFixed(3)}
+                      </div>
+                    </div>
+                    <div
+                      className={`rounded-full px-3 py-1 text-xs ${
+                        center.simulation?.risk === "High"
+                          ? "bg-red-500/15 text-red-200"
+                          : center.simulation?.risk === "Medium"
+                          ? "bg-orange-500/15 text-orange-200"
+                          : "bg-emerald-500/15 text-emerald-200"
+                      }`}
+                    >
+                      {center.simulation?.risk || "Not run"}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 text-xs md:grid-cols-5">
+                    <div className="rounded-xl bg-black/25 p-2">
+                      <div className="text-slate-500">Base</div>
+                      <div className="font-bold text-white">{center.baseLoadMW} MW</div>
+                    </div>
+                    <div className="rounded-xl bg-black/25 p-2">
+                      <div className="text-slate-500">Optimal</div>
+                      <div className="font-bold text-orange-200">
+                        {center.optimalLoadMW} MW
+                      </div>
+                    </div>
+                    <div className="rounded-xl bg-black/25 p-2">
+                      <div className="text-slate-500">ΔT</div>
+                      <div className="font-bold text-white">
+                        {center.simulation?.deltaT ?? "—"} °C
+                      </div>
+                    </div>
+                    <div className="rounded-xl bg-black/25 p-2">
+                      <div className="text-slate-500">Max temp</div>
+                      <div className="font-bold text-white">
+                        {center.simulation?.maxTemp ?? "—"} °C
+                      </div>
+                    </div>
+                    <div className="rounded-xl bg-black/25 p-2">
+                      <div className="text-slate-500">Extra</div>
+                      <div className="font-bold text-cyan-200">
+                        {center.simulation?.assignedExtra ?? "—"} MW
+                      </div>
+                    </div>
+                  </div>
+
+                  {center.simulation?.assets && !center.simulation?.error && (
+                    <div className="mt-4 grid grid-cols-2 gap-2 md:grid-cols-4">
+                      {["masks", "final", "anomaly"].map((k) => {
+                        const u = center.simulation.assets[k];
+                        if (!u) return null;
+                        const src = u.startsWith("http") ? u : `${apiBase}${u}`;
+                        return (
+                          <a
+                            key={k}
+                            href={src}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="block overflow-hidden rounded-xl border border-white/10 bg-black/40"
+                          >
+                            <img
+                              src={src}
+                              alt={k}
+                              className="h-24 w-full object-cover"
+                            />
+                            <div className="px-2 py-1 text-[10px] capitalize text-slate-400">
+                              {k === "final" ? "Final T" : k}
+                            </div>
+                          </a>
+                        );
+                      })}
+                      {center.simulation.assets.gif && (
+                        <div className="col-span-2 overflow-hidden rounded-xl border border-white/10 bg-black/40 md:col-span-4">
+                          <div className="px-2 py-1 text-[10px] text-slate-400">
+                            Heat GIF
+                          </div>
+                          <img
+                            src={
+                              center.simulation.assets.gif.startsWith("http")
+                                ? center.simulation.assets.gif
+                                : `${apiBase}${center.simulation.assets.gif}`
+                            }
+                            alt="gif"
+                            className="max-h-48 w-full object-contain"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="mt-2 text-xs text-slate-500">
+                    {center.simulation?.status || "—"}
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
+        )}
       </motion.div>
     </motion.div>
   );

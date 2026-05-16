@@ -1,10 +1,12 @@
+from dotenv import load_dotenv
 import os
-GOOGLE_STUDIO_AI_API_KEY=os.getenv("GOOGLE_API_KEY")
+load_dotenv()
+GOOGLE_STUDIO_AI_API_KEY = os.environ.get("GOOGLE_STUDIO_AI_API_KEY")
 MODEL = "gemini-3.1-flash-lite-preview"
 
 from google import genai
 from google.genai import types
-
+print(GOOGLE_STUDIO_AI_API_KEY, "API KEY")
 client = genai.Client(api_key=GOOGLE_STUDIO_AI_API_KEY)
 
 import re

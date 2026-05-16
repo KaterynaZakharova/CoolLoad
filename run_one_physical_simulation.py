@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
+from matplotlib.patches import FancyArrowPatch
 
 from buildings_latlon import latlon_to_central_building_mask
 
@@ -1617,6 +1618,35 @@ def save_animation(
         levels=[0.5],
         colors="white",
         linewidths=1.2,
+    )
+
+    ref = max(1e-9, float(np.hypot(wind_x, wind_y)))
+    sx = wind_x / ref
+    sy = wind_y / ref
+    L = 0.075
+
+    wind_arrow = FancyArrowPatch(
+        (0.82, 0.14),
+        (0.82 + L * sx, 0.14 + L * sy),
+        transform=ax.transAxes,
+        arrowstyle="-|>",
+        mutation_scale=13,
+        color="#a7f3d0",
+        linewidth=2.2,
+        zorder=100,
+        clip_on=False,
+    )
+    ax.add_patch(wind_arrow)
+    ax.text(
+        0.82,
+        0.055,
+        "Wind",
+        transform=ax.transAxes,
+        fontsize=9,
+        color="#a7f3d0",
+        ha="center",
+        va="top",
+        zorder=101,
     )
 
     _style_clean_thermal_figure(fig, ax)
