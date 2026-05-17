@@ -1430,7 +1430,22 @@ def _style_clean_thermal_figure(fig, ax) -> None:
     ax.set_axis_off()
     for spine in ax.spines.values():
         spine.set_visible(False)
-    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.98)
+
+
+def _add_thermal_colorbar(
+    fig,
+    mappable,
+    ax,
+    label: str,
+    *,
+    right_pad: float = 0.88,
+) -> None:
+    """Colorbar for thermal imshow panels (dark theme)."""
+    cb = fig.colorbar(mappable, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label(label, color="#94a3b8", fontsize=10)
+    cb.ax.yaxis.set_tick_params(color="#94a3b8")
+    plt.setp(cb.ax.get_yticklabels(), color="#94a3b8")
+    fig.subplots_adjust(left=0.06, right=right_pad, bottom=0.06, top=0.92)
 
 
 def plot_masks(
@@ -1475,7 +1490,7 @@ def plot_final_temperature(
 
     vmax_temp = max(float(np.percentile(T_final, 99.7)), T_air + 1.0)
 
-    ax.imshow(
+    im_t = ax.imshow(
         T_final.T,
         origin="lower",
         cmap="inferno",
@@ -1499,6 +1514,7 @@ def plot_final_temperature(
     )
 
     _style_clean_thermal_figure(fig, ax)
+    _add_thermal_colorbar(fig, im_t, ax, "Temperature [°C]")
     tmax = float(T_final.max())
     fig.text(
         0.04,
@@ -1529,7 +1545,7 @@ def plot_final_temperature(
 
     vmax_anomaly = max(float(np.percentile(anomaly, 99.7)), 0.5)
 
-    ax.imshow(
+    im_a = ax.imshow(
         anomaly.T,
         origin="lower",
         cmap="RdYlBu_r",
@@ -1553,6 +1569,7 @@ def plot_final_temperature(
     )
 
     _style_clean_thermal_figure(fig, ax)
+    _add_thermal_colorbar(fig, im_a, ax, "ΔT above ambient [°C]")
     fig.text(
         0.04,
         0.94,
@@ -1650,6 +1667,7 @@ def save_animation(
     )
 
     _style_clean_thermal_figure(fig, ax)
+    _add_thermal_colorbar(fig, im, ax, "Temperature [°C]")
     title = fig.suptitle(
         f"Heat plume · {T_air:.1f}°C ambient",
         color="white",

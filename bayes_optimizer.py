@@ -32,6 +32,9 @@ EXTRA_TOTAL_LOAD_MW = 5.0
 
 MIN_LOAD_MW = 1.0
 MAX_LOAD_MW = 150.0
+PER_SITE_FLEET_CAP_MW = MAX_LOAD_MW
+# Capped (rejected) sites stay within [cap - slack, cap] during BO/refine/report.
+AGENT_CAP_HOLD_SLACK_MW = 1.0
 
 # Fewer total expensive physics evals for quick API runs; each eval = one GP observation.
 N_GLOBAL_CANDIDATES = 12
@@ -157,7 +160,10 @@ def compute_single_datacenter_objective(metrics: Dict[str, Any]) -> float:
     )
 
 
-def compute_total_objective(results: List[Dict[str, Any]]) -> float:
+def compute_total_objective(
+    results: List[Dict[str, Any]],
+    site_weights: Optional[np.ndarray] = None,
+) -> float:
     """
     Load-spreading objective for Bayesian optimization.
 
@@ -183,13 +189,22 @@ def compute_total_objective(results: List[Dict[str, Any]]) -> float:
     mean_deltas = []
     max_temps = []
     hot_area_penalty = 0.0
+    n = len(results)
+    weights = np.ones(n, dtype=float)
+    if site_weights is not None:
+        weights = np.asarray(site_weights, dtype=float).reshape(-1)
+        if weights.size != n:
+            raise ValueError("site_weights length must match results length")
 
-    for result in results:
+    for i, result in enumerate(results):
         metrics = _get_metrics(result)
+        w = float(weights[i])
 
-        central_delta = float(metrics.get("central_building_anomaly_C", 0.0))
-        max_delta = float(metrics.get("max_anomaly_C", central_delta))
-        mean_delta = float(metrics.get("mean_anomaly_C", 0.0))
+        central_raw = float(metrics.get("central_building_anomaly_C", 0.0))
+        max_raw = float(metrics.get("max_anomaly_C", central_raw))
+        central_delta = central_raw * w
+        max_delta = max_raw * w
+        mean_delta = float(metrics.get("mean_anomaly_C", 0.0)) * w
         max_temp = float(metrics.get("max_temp_C", 0.0))
 
         hot1 = float(metrics.get("hot_area_gt_1C_cells", 0.0))
@@ -201,7 +216,7 @@ def compute_total_objective(results: List[Dict[str, Any]]) -> float:
         mean_deltas.append(mean_delta)
         max_temps.append(max_temp)
 
-        hot_area_penalty += hot1 + 3.0 * hot2 + 10.0 * hot5
+        hot_area_penalty += w * (hot1 + 3.0 * hot2 + 10.0 * hot5)
 
     max_deltas = np.asarray(max_deltas, dtype=float)
     central_deltas = np.asarray(central_deltas, dtype=float)
@@ -524,10 +539,29 @@ def evaluate_load_distribution(
     save_gif: bool = False,
     verbose: bool = False,
     fast_evaluation: bool = False,
+    objective_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, List[Dict[str, Any]]]:
     """
     Run simulation for all datacenters with the given load distribution.
+
+    ``objective_context`` may include:
+        - ``site_weights``: per-site multipliers on thermal terms (orchestrator / agents)
+        - ``max_loads_mw``: hard per-site MW caps before evaluation
     """
+    loads_mw = np.asarray(loads_mw, dtype=float).reshape(-1).copy()
+    n_dc = len(datacenters)
+    if objective_context and objective_context.get("min_loads_mw") is not None:
+        min_for_clip = np.asarray(objective_context["min_loads_mw"], dtype=float).reshape(-1)
+    else:
+        min_for_clip = np.full(n_dc, MIN_LOAD_MW, dtype=float)
+    loads_mw = clip_loads_for_objective_context(
+        loads_mw, min_for_clip, objective_context
+    )
+
+    site_weights = None
+    if objective_context and objective_context.get("site_weights") is not None:
+        site_weights = np.asarray(objective_context["site_weights"], dtype=float)
+
     results = []
 
     for i, datacenter in enumerate(datacenters):
@@ -551,7 +585,7 @@ def evaluate_load_distribution(
 
         results.append(result)
 
-    objective = compute_total_objective(results)
+    objective = compute_total_objective(results, site_weights=site_weights)
 
     return objective, results
 
@@ -571,6 +605,7 @@ def coordinate_refine_loads(
     max_passes_per_step: int = 1,
     verbose: bool = True,
     fast_evaluation: bool = True,
+    objective_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, float, List[Dict[str, Any]]]:
     """
     Local search by moving load from one datacenter to another.
@@ -588,6 +623,7 @@ def coordinate_refine_loads(
         save_gif=False,
         verbose=False,
         fast_evaluation=fast_evaluation,
+        objective_context=objective_context,
     )
 
     n = len(current_loads)
@@ -632,6 +668,7 @@ def coordinate_refine_loads(
                         save_gif=False,
                         verbose=False,
                         fast_evaluation=fast_evaluation,
+                        objective_context=objective_context,
                     )
 
                     if candidate_obj < current_obj:
@@ -676,25 +713,160 @@ def build_per_site_bounds(
     """
     Per-site MW bounds consistent with the dashboard.
 
-    Each site's load never goes below its baseline ``base_loads_mw`` (nor below ``min_floor_mw``,
-    whichever is higher per site). Upper bounds allow any split of ``extra_total_load_mw`` across
-    sites subject to ``max_cap_mw`` (each site's max is the feasible ceiling if all others sit at
-    their minimum).
+    Each site's load is at least ``max(base, min_floor_mw)``. Each site may go up to
+    ``max_cap_mw`` (default 150 MW per datacenter). Fleet-wide headroom is up to
+    ``max_cap_mw * n_sites`` — we do **not** tighten per-site max from the target split,
+    so high baselines + moderate extra stay feasible.
     """
     base = np.asarray(base_loads_mw, dtype=float).reshape(-1)
     n = int(base.size)
     extra = float(extra_total_load_mw)
-    cap = float(max_cap_mw)
+    per_site_cap = float(max_cap_mw)
     floor_f = float(min_floor_mw)
 
     target_total = float(base.sum() + extra)
     min_loads = np.maximum(base, floor_f)
     sum_min = float(min_loads.sum())
 
-    max_loads = np.empty(n, dtype=float)
-    for i in range(n):
-        room = target_total - (sum_min - float(min_loads[i]))
-        max_loads[i] = min(cap, max(float(min_loads[i]), room))
+    # If mins alone exceed target (e.g. negative extra), allow mins down to baseline.
+    if sum_min > target_total + 1e-6:
+        min_loads = base.copy()
+        sum_min = float(min_loads.sum())
+
+    max_loads = np.maximum(min_loads, per_site_cap)
+
+    sum_max = float(max_loads.sum())
+    if sum_max < target_total - 1e-6:
+        raise ValueError(
+            f"Infeasible target total load {target_total:.3f} MW: "
+            f"fleet max is {sum_max:.3f} MW ({per_site_cap:.0f} MW × {n} sites). "
+            f"Raise max_cap_mw or reduce extra_total_load_mw."
+        )
+    if float(min_loads.sum()) > target_total + 1e-6:
+        raise ValueError(
+            f"Infeasible target total load {target_total:.3f} MW: "
+            f"minimum sum {float(min_loads.sum()):.3f} MW (baselines). "
+            f"Increase extra_total_load_mw or lower base loads."
+        )
+
+    return min_loads, max_loads
+
+
+def merge_objective_max_loads(
+    min_loads: np.ndarray,
+    max_loads: np.ndarray,
+    objective_context: Optional[Dict[str, Any]],
+    fleet_cap_mw: float = PER_SITE_FLEET_CAP_MW,
+) -> np.ndarray:
+    """
+    Keep per-site fleet headroom (``fleet_cap_mw``) on accepted sites.
+
+    Only sites listed in ``rejected_site_indices`` (or with caps below fleet)
+    are tightened from ``objective_context['max_loads_mw']``.
+    """
+    min_loads = np.asarray(min_loads, dtype=float).reshape(-1)
+    max_loads = np.asarray(max_loads, dtype=float).reshape(-1).copy()
+    n = int(max_loads.size)
+    fleet_cap = float(
+        (objective_context or {}).get("per_site_fleet_cap_mw", fleet_cap_mw)
+    )
+    fleet_max = np.maximum(min_loads, fleet_cap)
+
+    if not objective_context or objective_context.get("max_loads_mw") is None:
+        return np.maximum(max_loads, fleet_max)
+
+    caps = np.asarray(objective_context["max_loads_mw"], dtype=float).reshape(-1)
+    if caps.size != n:
+        return np.maximum(max_loads, fleet_max)
+
+    rejected = set(objective_context.get("rejected_site_indices") or [])
+    if not rejected:
+        for i in range(n):
+            if caps[i] < fleet_max[i] - 1e-3:
+                rejected.add(i)
+
+    out = fleet_max.copy()
+    for i in rejected:
+        out[i] = min(fleet_max[i], max(min_loads[i], caps[i]))
+    return out
+
+
+def clip_loads_for_objective_context(
+    loads_mw: np.ndarray,
+    min_loads: np.ndarray,
+    objective_context: Optional[Dict[str, Any]],
+    fleet_cap_mw: float = PER_SITE_FLEET_CAP_MW,
+) -> np.ndarray:
+    """Clip candidate loads only on rejected sites (orchestrator caps)."""
+    if not objective_context or objective_context.get("max_loads_mw") is None:
+        return np.asarray(loads_mw, dtype=float).reshape(-1).copy()
+
+    min_loads = np.asarray(min_loads, dtype=float).reshape(-1)
+    loads = np.asarray(loads_mw, dtype=float).reshape(-1).copy()
+    n = loads.size
+    caps = np.asarray(objective_context["max_loads_mw"], dtype=float).reshape(-1)
+    if caps.size != n:
+        return loads
+
+    fleet_cap = float(objective_context.get("per_site_fleet_cap_mw", fleet_cap_mw))
+    fleet_max = np.maximum(min_loads, fleet_cap)
+    rejected = set(objective_context.get("rejected_site_indices") or [])
+    if not rejected:
+        for i in range(n):
+            if caps[i] < fleet_max[i] - 1e-3:
+                rejected.add(i)
+
+    for i in rejected:
+        loads[i] = min(loads[i], max(min_loads[i], caps[i]))
+    return loads
+
+
+def _rejected_site_indices_from_context(
+    objective_context: Optional[Dict[str, Any]],
+    n: int,
+    fleet_max: np.ndarray,
+    caps: np.ndarray,
+) -> set[int]:
+    rejected = set(objective_context.get("rejected_site_indices") or []) if objective_context else set()
+    if not rejected and objective_context and caps.size == n:
+        for i in range(n):
+            if caps[i] < fleet_max[i] - 1e-3:
+                rejected.add(i)
+    return rejected
+
+
+def resolve_agent_load_bounds(
+    min_loads: np.ndarray,
+    max_loads: np.ndarray,
+    objective_context: Optional[Dict[str, Any]],
+    fleet_cap_mw: float = PER_SITE_FLEET_CAP_MW,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Merge orchestrator MW caps into max bounds and raise mins on capped sites so
+    refinement cannot drain a rejected site to baseline when the cap is ~81 MW.
+    """
+    min_loads = np.asarray(min_loads, dtype=float).reshape(-1).copy()
+    max_loads = np.asarray(max_loads, dtype=float).reshape(-1).copy()
+    n = int(max_loads.size)
+    max_loads = merge_objective_max_loads(min_loads, max_loads, objective_context, fleet_cap_mw)
+
+    if not objective_context or objective_context.get("max_loads_mw") is None:
+        return min_loads, max_loads
+
+    caps = np.asarray(objective_context["max_loads_mw"], dtype=float).reshape(-1)
+    if caps.size != n:
+        return min_loads, max_loads
+
+    fleet_cap = float(objective_context.get("per_site_fleet_cap_mw", fleet_cap_mw))
+    fleet_max = np.maximum(min_loads, fleet_cap)
+    rejected = _rejected_site_indices_from_context(objective_context, n, fleet_max, caps)
+    slack = float(objective_context.get("agent_cap_hold_slack_mw", AGENT_CAP_HOLD_SLACK_MW))
+
+    for i in rejected:
+        cap_i = float(max_loads[i])
+        floor_i = max(float(min_loads[i]), cap_i - slack)
+        min_loads[i] = min(floor_i, cap_i)
+
     return min_loads, max_loads
 
 
@@ -1106,6 +1278,8 @@ def build_html_report(
     asset_rows: List[Dict[str, str]],
     chart_paths: Dict[str, str],
     narrative_html: Optional[str] = None,
+    effective_min_loads_mw: Optional[List[float]] = None,
+    effective_max_loads_mw: Optional[List[float]] = None,
 ) -> str:
     """HTML report with chart and gallery URLs rooted at ``/opt-out/{run_id}/`` for HTTP serving."""
 
@@ -1139,17 +1313,33 @@ def build_html_report(
         )
         rf_body += "</tr>"
 
-    best_head = "<tr><th>Site</th><th>Base MW</th><th>Optimal MW</th><th>Δ MW</th><th>Max T °C</th><th>Central ΔT</th></tr>"
+    has_caps = (
+        effective_max_loads_mw is not None
+        and len(effective_max_loads_mw) == len(datacenter_names)
+    )
+    cap_head = "<th>Agent cap MW</th>" if has_caps else ""
+    best_head = (
+        f"<tr><th>Site</th><th>Base MW</th>{cap_head}"
+        "<th>Optimal MW</th><th>Δ MW</th><th>Max T °C</th><th>Central ΔT</th></tr>"
+    )
     best_body = ""
     for i, name in enumerate(datacenter_names):
         m = best_per_site[i]["metrics"]
         bl = best_loads_mw[i]
         b0 = base_loads_mw[i]
+        cap_cell = ""
+        if has_caps:
+            cap_v = float(effective_max_loads_mw[i])
+            fleet = float(PER_SITE_FLEET_CAP_MW)
+            cap_cell = (
+                f"<td>{cap_v:.3f}</td>"
+                if cap_v < fleet - 1e-3
+                else "<td>—</td>"
+            )
         best_body += "<tr>"
+        best_body += f"<td>{escape(name)}</td><td>{b0:.3f}</td>{cap_cell}"
         best_body += row_cells(
             [
-                name,
-                f"{b0:.3f}",
                 f"{bl:.3f}",
                 f"{bl - b0:+.3f}",
                 f"{float(m.get('max_temp_C', 0)):.2f}",
@@ -1227,6 +1417,14 @@ def build_html_report(
         gallery += "</div>"
     gallery += "</section>"
 
+    cap_lead = ""
+    if has_caps:
+        cap_lead = (
+            "<p class='lead'>Sites with an <strong>Agent cap</strong> were limited after local review; "
+            "reported optimal MW respects each cap (held within about 1 MW of the cap) while "
+            "preserving the fleet total.</p>"
+        )
+
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Thermal load optimization — {escape(run_id)}</title>
@@ -1273,6 +1471,7 @@ section {{ max-width:1100px; margin:0 auto; }}
 <h2>Local refinement</h2>
 <table><thead>{rf_head}</thead><tbody>{rf_body}</tbody></table>
 <h2>Best MW per site (after optimization)</h2>
+{cap_lead}
 <table><thead>{best_head}</thead><tbody>{best_body}</tbody></table>
 </section>
 {gallery}
@@ -1296,11 +1495,34 @@ def write_optimization_report_bundle(
     best_results: List[Dict[str, Any]],
     final_asset_rel: List[Dict[str, str]],
     *,
+    min_loads_mw: Optional[np.ndarray] = None,
+    max_loads_mw: Optional[np.ndarray] = None,
     optimizer_meta: Optional[Dict[str, Any]] = None,
     random_seed: int = RANDOM_SEED,
 ) -> Tuple[Path, Path, Dict[str, str]]:
     run_root.mkdir(parents=True, exist_ok=True)
     names = [str(dc.get("name", f"site_{i}")) for i, dc in enumerate(datacenters)]
+    base_loads_mw = np.asarray(base_loads_mw, dtype=float).reshape(-1)
+    n = len(datacenters)
+    floor_min = (
+        np.asarray(min_loads_mw, dtype=float).reshape(-1)
+        if min_loads_mw is not None
+        else np.maximum(base_loads_mw, MIN_LOAD_MW)
+    )
+    fleet_max = (
+        np.asarray(max_loads_mw, dtype=float).reshape(-1)
+        if max_loads_mw is not None
+        else np.full(n, PER_SITE_FLEET_CAP_MW, dtype=float)
+    )
+    agent_ctx = (optimizer_meta or {}).get("final_objective_context")
+    target_total = float(base_loads_mw.sum() + extra_total_load_mw)
+    eff_min, eff_max = resolve_agent_load_bounds(floor_min, fleet_max, agent_ctx)
+    best_loads_mw = project_loads_to_bounds(
+        np.asarray(best_loads_mw, dtype=float).reshape(-1),
+        eff_min,
+        eff_max,
+        target_total,
+    )
     best_per = slim_eval_results(best_results)
     optimal_payload: Dict[str, Any] = {
         "run_id": run_id,
@@ -1314,6 +1536,8 @@ def write_optimization_report_bundle(
     }
     if optimizer_meta:
         optimal_payload.update(optimizer_meta)
+    optimal_payload["effective_min_loads_mw"] = eff_min.tolist()
+    optimal_payload["effective_max_loads_mw"] = eff_max.tolist()
 
     chart_paths = write_optimization_charts(
         run_root=run_root,
@@ -1358,6 +1582,8 @@ def write_optimization_report_bundle(
         asset_rows=final_asset_rel,
         chart_paths=chart_paths,
         narrative_html=narrative_html,
+        effective_min_loads_mw=eff_min.tolist(),
+        effective_max_loads_mw=eff_max.tolist(),
     )
     html_path = run_root / "report.html"
     with open(html_path, "w", encoding="utf-8") as f:
@@ -1383,6 +1609,7 @@ def optimize_datacenter_loads_iter(
     top_k_refine: int = TOP_K_REFINE,
     random_seed: int = RANDOM_SEED,
     verbose: bool = True,
+    objective_context: Optional[Dict[str, Any]] = None,
 ) -> Iterator[Dict[str, Any]]:
     """
     Yields progress/log dicts, then a final ``{"type": "complete", "result": ...}``.
@@ -1412,6 +1639,10 @@ def optimize_datacenter_loads_iter(
 
     if base_loads.shape[0] != n or min_loads.shape[0] != n or max_loads.shape[0] != n:
         raise ValueError("base_loads_mw, min_loads_mw, max_loads_mw must match datacenters count.")
+
+    min_loads, max_loads = resolve_agent_load_bounds(
+        min_loads, max_loads, objective_context
+    )
 
     target_total_load = float(base_loads.sum() + extra_total_load_mw)
 
@@ -1522,6 +1753,7 @@ def optimize_datacenter_loads_iter(
             save_gif=False,
             verbose=False,
             fast_evaluation=True,
+            objective_context=objective_context,
         )
 
         if d_latent > 0:
@@ -1582,6 +1814,7 @@ def optimize_datacenter_loads_iter(
             max_passes_per_step=1,
             verbose=False,
             fast_evaluation=True,
+            objective_context=objective_context,
         )
         refine_step_counter += 1
 
@@ -1604,6 +1837,27 @@ def optimize_datacenter_loads_iter(
 
     refined_history = sorted(refined_history, key=lambda x: x["objective"])
     best = refined_history[0]
+
+    snapped = project_loads_to_bounds(
+        np.asarray(best["loads_mw"], dtype=float),
+        min_loads,
+        max_loads,
+        target_total_load,
+    )
+    if float(np.max(np.abs(snapped - np.asarray(best["loads_mw"], dtype=float)))) > 0.01:
+        snap_obj, snap_results = evaluate_load_distribution(
+            datacenters=datacenters,
+            loads_mw=snapped,
+            cache=cache,
+            run_id=run_id,
+            save_gif=False,
+            verbose=False,
+            fast_evaluation=True,
+            objective_context=objective_context,
+        )
+        best["loads_mw"] = snapped
+        best["objective"] = snap_obj
+        best["results"] = snap_results
 
     if verbose:
         print(f"\nBEST objective={best['objective']:.4f}, loads={np.round(best['loads_mw'], 4)}")
@@ -1629,6 +1883,7 @@ def optimize_datacenter_loads_iter(
         "bo_ei_evals": int(n_bo),
         "bo_latent_dim": int(d_latent),
         "random_seed": int(random_seed),
+        "objective_context": objective_context,
     }
 
     yield {"type": "complete", "result": result}

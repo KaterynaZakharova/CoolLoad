@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Upload,
@@ -23,6 +23,8 @@ import {
   ImageIcon,
   BarChart3,
   Server,
+  Bot,
+  MessageSquare,
 } from "lucide-react";
 
 import { MapContainer, TileLayer, Marker, useMap } from "react-leaflet";
@@ -78,7 +80,7 @@ function CardContent({ children, className = "" }) {
 }
 
 /* -------------------------------------------------------
-   Mock data
+   Demo data
 ------------------------------------------------------- */
 
 const IMAGE_PLACEHOLDERS = [
@@ -127,7 +129,7 @@ const INITIAL_CENTERS = [
       temp: 8,
       humidity: 71,
       solar: 410,
-      windSpeed: 5.8,
+      windSpeed: 0.2,
       windDirection: "W",
     },
     image: IMAGE_PLACEHOLDERS[2],
@@ -205,7 +207,7 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function mockParsePdf(fileName, index) {
+function demoParsePdf(fileName, index) {
   const preset = PRESET_UPLOAD_RESULTS[index % PRESET_UPLOAD_RESULTS.length];
   const cleanName = fileName?.replace(/\.pdf$/i, "").replace(/[_-]/g, " ");
 
@@ -368,6 +370,7 @@ function generateReport(centers, newLoad, optimizationMeta = null) {
       optimalLoadMW: c.optimalLoad,
       weather: c.weather,
       simulation: c.simulation,
+      agentVerdict: c.agentVerdict ?? null,
     })),
   };
 }
@@ -505,6 +508,254 @@ function LoadBar({ label, value, max, tone = "cyan" }) {
         />
       </div>
     </div>
+  );
+}
+
+const AGENT_PHASES = new Set([
+  "agent_review",
+  "agent_site",
+  "agent_orchestrator",
+]);
+
+function buildAgentConversationEntries(bayesEvents, agentHistory) {
+  const entries = [];
+  let seq = 0;
+  const push = (entry) => entries.push({ id: seq++, ...entry });
+
+  for (const ev of bayesEvents || []) {
+    if (ev.type !== "log" || !AGENT_PHASES.has(ev.phase)) continue;
+    if (ev.phase === "agent_site") {
+      push({
+        kind: "site",
+        round: ev.agent_round ?? 0,
+        siteIndex: ev.site_index,
+        siteName: ev.site_name,
+        verdict: ev.verdict,
+        loadMw: ev.load_mw,
+        reasons: ev.reasons || [],
+        concerns: ev.concerns || [],
+        source: ev.source,
+        centralDeltaT: ev.central_delta_t_c,
+        message: ev.message,
+      });
+    } else if (ev.phase === "agent_orchestrator") {
+      push({
+        kind: "orchestrator",
+        round: ev.agent_round ?? 0,
+        message: ev.orchestrator_notes || ev.message,
+      });
+    } else {
+      push({
+        kind: "system",
+        round: ev.agent_round ?? 0,
+        message: ev.message,
+      });
+    }
+  }
+
+  if (entries.length === 0 && agentHistory?.length) {
+    for (const round of agentHistory) {
+      const ri = round.round ?? 0;
+      push({
+        kind: "system",
+        round: ri,
+        message: `Review round ${ri + 1} — ${
+          round.all_accepted ? "all sites accepted" : "orchestrator adjusting loads"
+        }`,
+      });
+      for (const r of round.reviews || []) {
+        push({
+          kind: "site",
+          round: ri,
+          siteIndex: r.site_index,
+          siteName: r.site_name,
+          verdict: r.verdict,
+          loadMw: r.load_mw,
+          reasons: r.reasons || [],
+          concerns: r.concerns || [],
+          source: r.source,
+          centralDeltaT: r.central_delta_t_c,
+          message: r.reasons?.join(" ") || "",
+        });
+      }
+    }
+  }
+
+  return entries;
+}
+
+function AgentConversationPanel({
+  bayesEvents,
+  agentHistory,
+  centers,
+  isRunning,
+}) {
+  const entries = useMemo(
+    () => buildAgentConversationEntries(bayesEvents, agentHistory),
+    [bayesEvents, agentHistory]
+  );
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [entries.length, isRunning]);
+
+  const siteColor = (name) => {
+    const idx = centers.findIndex((c) => c.name === name);
+    const hues = [
+      "border-cyan-400/40 bg-cyan-500/10",
+      "border-violet-400/40 bg-violet-500/10",
+      "border-emerald-400/40 bg-emerald-500/10",
+      "border-amber-400/40 bg-amber-500/10",
+      "border-rose-400/40 bg-rose-500/10",
+      "border-sky-400/40 bg-sky-500/10",
+    ];
+    return hues[(idx >= 0 ? idx : name?.length || 0) % hues.length];
+  };
+
+  return (
+    <Card className="border-violet-400/25 bg-white/[0.04] shadow-2xl shadow-black/30 backdrop-blur-xl">
+      <CardContent className="p-5">
+        <motion.div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="flex items-center gap-2 text-lg font-bold text-white">
+              <MessageSquare className="h-5 w-5 text-violet-300" />
+              Datacenter agent conversation
+            </h2>
+            <p className="mt-1 max-w-2xl text-sm text-slate-400">
+              Local site agents review plume / anomaly imagery; the orchestrator
+              replies when loads must be redistributed.
+            </p>
+          </div>
+          {isRunning && (
+            <div className="flex items-center gap-2 rounded-full border border-violet-400/30 bg-violet-500/10 px-3 py-1.5 text-xs text-violet-200">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              Live
+            </div>
+          )}
+        </motion.div>
+
+        <div
+          ref={scrollRef}
+          className="min-h-[22rem] max-h-[min(52vh,520px)] overflow-y-auto rounded-2xl border border-white/10 bg-slate-950/80 p-4 md:min-h-[26rem] md:p-5"
+        >
+          {entries.length === 0 ? (
+            <div className="flex h-full min-h-[18rem] flex-col items-center justify-center text-center text-sm text-slate-500">
+              <Bot className="mb-3 h-10 w-10 text-slate-600" />
+              <p>No agent messages yet.</p>
+              <p className="mt-1 text-xs">
+                Run optimization to see per-datacenter accept / reject dialogue and
+                orchestrator responses.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {entries.map((entry) => {
+                if (entry.kind === "orchestrator") {
+                  return (
+                    <div
+                      key={entry.id}
+                      className="rounded-2xl border border-violet-500/35 bg-violet-500/10 p-4"
+                    >
+                      <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-violet-200">
+                        <Bot className="h-4 w-4" />
+                        Global orchestrator
+                        {entry.round > 0 && (
+                          <span className="font-normal text-violet-300/80">
+                            · after round {entry.round}
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-sm leading-relaxed text-slate-200">
+                        {entry.message}
+                      </p>
+                    </div>
+                  );
+                }
+                if (entry.kind === "system") {
+                  return (
+                    <div
+                      key={entry.id}
+                      className="mx-auto max-w-[95%] rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-center text-xs text-slate-400"
+                    >
+                      {entry.round > 0 && (
+                        <span className="mr-2 font-mono text-slate-500">
+                          R{entry.round + 1}
+                        </span>
+                      )}
+                      {entry.message}
+                    </div>
+                  );
+                }
+                const accept = entry.verdict === "accept";
+                return (
+                  <div
+                    key={entry.id}
+                    className={`rounded-2xl border p-4 ${siteColor(entry.siteName)}`}
+                  >
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <Server className="h-4 w-4 text-cyan-300" />
+                      <span className="font-semibold text-white">
+                        {entry.siteName}
+                      </span>
+                      <span
+                        className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold uppercase ${
+                          accept
+                            ? "bg-emerald-500/20 text-emerald-200"
+                            : "bg-amber-500/20 text-amber-200"
+                        }`}
+                      >
+                        {entry.verdict}
+                      </span>
+                      {entry.loadMw != null && (
+                        <span className="font-mono text-xs text-slate-400">
+                          {Number(entry.loadMw).toFixed(2)} MW
+                        </span>
+                      )}
+                      {entry.source && (
+                        <span className="text-[10px] text-slate-500">
+                          via {entry.source}
+                        </span>
+                      )}
+                    </div>
+                    {entry.centralDeltaT != null && (
+                      <p className="mb-2 text-xs text-slate-400">
+                        Central ΔT:{" "}
+                        <span className="font-mono text-slate-200">
+                          {Number(entry.centralDeltaT).toFixed(2)} °C
+                        </span>
+                      </p>
+                    )}
+                    {entry.concerns?.length > 0 && (
+                      <div className="mb-2 flex flex-wrap gap-1.5">
+                        {entry.concerns.map((c) => (
+                          <span
+                            key={c}
+                            className="rounded-md bg-black/30 px-2 py-0.5 text-[10px] text-amber-200/90"
+                          >
+                            {c.replace(/_/g, " ")}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {(entry.reasons?.length > 0 || entry.message) && (
+                      <ul className="list-inside list-disc space-y-1 text-sm leading-relaxed text-slate-300">
+                        {(entry.reasons?.length ? entry.reasons : [entry.message])
+                          .filter(Boolean)
+                          .map((line, i) => (
+                            <li key={i}>{line}</li>
+                          ))}
+                      </ul>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -1120,7 +1371,13 @@ function LoadControlPanel({
               </div>
             )}
             <div className="max-h-40 overflow-y-auto font-mono text-[10px] leading-relaxed text-slate-300">
-              {bayesEvents.slice(-40).map((ev, i) => (
+              {bayesEvents
+                .filter(
+                  (ev) =>
+                    ev.type !== "log" || !AGENT_PHASES.has(ev.phase)
+                )
+                .slice(-40)
+                .map((ev, i) => (
                 <div key={i} className="border-b border-white/5 py-1 last:border-0">
                   {ev.type === "log" && <span className="text-cyan-300/90">log</span>}
                   {ev.type === "progress" && (
@@ -1288,13 +1545,11 @@ function ReportModal({ report, onClose, apiBase = "" }) {
     chartUrls[key] ? `${apiBase}${chartUrls[key]}` : null;
   const runId = opt.runId || opt.run_id;
   const reportHtmlUrl = opt.reportHtmlUrl || opt.report_html_url || "";
-  const [panelTab, setPanelTab] = useState(
-    () => (reportHtmlUrl ? "full" : "summary")
-  );
+  const [panelTab, setPanelTab] = useState("summary");
 
   useEffect(() => {
-    setPanelTab(reportHtmlUrl ? "full" : "summary");
-  }, [report.generatedAt, reportHtmlUrl]);
+    setPanelTab("summary");
+  }, [report.generatedAt]);
 
   const CHART_ORDER = [
     "improvement_trace",
@@ -1330,25 +1585,22 @@ function ReportModal({ report, onClose, apiBase = "" }) {
   return (
     <motion.div
       role="presentation"
-      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/75 p-4 backdrop-blur-md"
+      className="fixed inset-0 z-[9999] flex flex-col bg-slate-950"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
     >
       <motion.div
         role="dialog"
         aria-modal="true"
-        className="flex max-h-[92vh] w-full max-w-[min(1240px,98vw)] flex-col overflow-hidden rounded-3xl border border-white/10 bg-slate-950 shadow-2xl shadow-black/50"
-        initial={{ y: 24, opacity: 0, scale: 0.98 }}
-        animate={{ y: 0, opacity: 1, scale: 1 }}
-        exit={{ y: 24, opacity: 0, scale: 0.98 }}
-        transition={{ type: "spring", damping: 28, stiffness: 320 }}
+        className="flex h-full min-h-0 w-full flex-col overflow-hidden border border-white/10 bg-slate-950 shadow-2xl"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        transition={{ duration: 0.2 }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex flex-col gap-3 border-b border-white/10 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+        <motion.div className="flex shrink-0 flex-col gap-3 border-b border-white/10 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
             <div className="flex items-center gap-2 text-xl font-bold text-white">
               <BarChart3 className="h-5 w-5 shrink-0 text-cyan-300" />
@@ -1399,16 +1651,16 @@ function ReportModal({ report, onClose, apiBase = "" }) {
               Close
             </Button>
           </div>
-        </div>
+        </motion.div>
 
         {panelTab === "full" && fullReportSrc ? (
           <iframe
             title="Optimization HTML report"
             src={fullReportSrc}
-            className="h-[min(82vh,920px)] w-full flex-1 border-0 bg-[#0b1220]"
+            className="min-h-0 w-full flex-1 border-0 bg-[#0b1220]"
           />
         ) : (
-          <div className="max-h-[calc(92vh-5.5rem)] flex-1 overflow-y-auto p-5">
+          <motion.div className="min-h-0 flex-1 overflow-y-auto p-5 md:p-8">
             <div className="mb-6 grid grid-cols-1 gap-3 md:grid-cols-3">
               <Metric
                 icon={Zap}
@@ -1429,6 +1681,40 @@ function ReportModal({ report, onClose, apiBase = "" }) {
                 unit="MW"
               />
             </div>
+
+            {(opt.agentHistory || opt.agent_history)?.length > 0 && (
+              <motion.div className="mb-8 rounded-2xl border border-violet-500/25 bg-violet-500/5 p-5">
+                <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-violet-200">
+                  Local agent review
+                </h3>
+                <div className="space-y-2 text-xs text-slate-300">
+                  {(opt.agentHistory || opt.agent_history).map((round, ri) => (
+                    <motion.div key={ri} className="rounded-xl border border-white/10 bg-black/25 p-3">
+                      <div className="mb-2 font-medium text-violet-200">
+                        Round {round.round + 1}
+                        {round.all_accepted ? " · all accepted" : " · adjustments requested"}
+                      </div>
+                      <ul className="space-y-1">
+                        {(round.reviews || []).map((r) => (
+                          <li key={r.site_index}>
+                            <span
+                              className={
+                                r.verdict === "accept"
+                                  ? "text-emerald-300"
+                                  : "text-amber-300"
+                              }
+                            >
+                              {r.site_name}: {r.verdict}
+                            </span>
+                            {r.reasons?.[0] ? ` — ${r.reasons[0]}` : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    </motion.div>
+                  ))}
+                </div>
+              </motion.div>
+            )}
 
             {runId && chartKeys.length > 0 && (
               <div className="mb-8 rounded-2xl border border-cyan-500/20 bg-cyan-500/5 p-5">
@@ -1511,17 +1797,30 @@ function ReportModal({ report, onClose, apiBase = "" }) {
                         {center.location.lon.toFixed(3)}
                       </div>
                     </div>
-                    <div
-                      className={`rounded-full px-3 py-1 text-xs ${
-                        center.simulation?.risk === "High"
-                          ? "bg-red-500/15 text-red-200"
-                          : center.simulation?.risk === "Medium"
-                          ? "bg-orange-500/15 text-orange-200"
-                          : "bg-emerald-500/15 text-emerald-200"
-                      }`}
-                    >
-                      {center.simulation?.risk || "Not run"}
-                    </div>
+                    <motion.div className="flex flex-wrap gap-2">
+                      {center.agentVerdict && (
+                        <div
+                          className={`rounded-full px-3 py-1 text-xs ${
+                            center.agentVerdict === "accept"
+                              ? "bg-emerald-500/15 text-emerald-200"
+                              : "bg-amber-500/15 text-amber-200"
+                          }`}
+                        >
+                          Agent: {center.agentVerdict}
+                        </div>
+                      )}
+                      <div
+                        className={`rounded-full px-3 py-1 text-xs ${
+                          center.simulation?.risk === "High"
+                            ? "bg-red-500/15 text-red-200"
+                            : center.simulation?.risk === "Medium"
+                            ? "bg-orange-500/15 text-orange-200"
+                            : "bg-emerald-500/15 text-emerald-200"
+                        }`}
+                      >
+                        {center.simulation?.risk || "Not run"}
+                      </div>
+                    </motion.div>
                   </div>
 
                   <div className="grid grid-cols-2 gap-2 text-xs md:grid-cols-5">
@@ -1605,7 +1904,7 @@ function ReportModal({ report, onClose, apiBase = "" }) {
                 </div>
               ))}
             </div>
-          </div>
+          </motion.div>
         )}
       </motion.div>
     </motion.div>
@@ -1626,6 +1925,7 @@ export default function App() {
   const [showReport, setShowReport] = useState(false);
   const [simulationError, setSimulationError] = useState(null);
   const [bayesEvents, setBayesEvents] = useState([]);
+  const [agentHistory, setAgentHistory] = useState([]);
   const [optimizationProgress, setOptimizationProgress] = useState(null);
   const [lastOptimizationBundle, setLastOptimizationBundle] = useState(null);
   const [bayesianLoops, setBayesianLoops] = useState(12);
@@ -1659,8 +1959,8 @@ export default function App() {
     setLastOptimizationBundle(null);
   }
 
-  function addMockDataCenter(fileName = "uploaded_specification.pdf") {
-    const parsed = mockParsePdf(fileName, uploadIndex);
+  function addDemoDataCenter(fileName = "uploaded_specification.pdf") {
+    const parsed = demoParsePdf(fileName, uploadIndex);
     const id = `dc-${Date.now()}-${uploadIndex}`;
 
     const center = {
@@ -1823,6 +2123,7 @@ export default function App() {
     setReport(null);
     setSimulationError(null);
     setBayesEvents([]);
+    setAgentHistory([]);
     setOptimizationProgress(null);
     setLastOptimizationBundle(null);
   }
@@ -1859,6 +2160,7 @@ export default function App() {
     setIsRunning(true);
     setSimulationError(null);
     setBayesEvents([]);
+    setAgentHistory([]);
     setOptimizationProgress(null);
     setLastOptimizationBundle(null);
 
@@ -1912,6 +2214,7 @@ export default function App() {
             extra_total_load_mw: Number(newLoad),
             bayesian_loop_count: Math.min(80, Math.max(4, Number(bayesianLoops) || 12)),
             top_k_refine: 2,
+            agent_max_delta_t_with_concerns_c: 9.5,
           }),
           signal: controller.signal,
         });
@@ -1994,6 +2297,7 @@ export default function App() {
           ...center,
           optimalLoad: Number(Number(s.optimal_load_mw).toFixed(2)),
           simulation: buildSimulationFromBayesSite(s, t, runId),
+          agentVerdict: s.agent_verdict ?? null,
           dirty: false,
         };
       });
@@ -2016,7 +2320,10 @@ export default function App() {
         refinement: completeData.refined_slim,
         bayesianLoopCount: completeData.bayesian_loop_count,
         topKRefine: completeData.top_k_refine,
+        agentHistory: completeData.agent_history || [],
       };
+
+      setAgentHistory(completeData.agent_history || []);
 
       const generated = generateReport(updated, newLoad, optMeta);
       setCenters(updated);
@@ -2104,9 +2411,9 @@ export default function App() {
                     />
                   </label>
 
-                  <Button variant="outline" onClick={() => addMockDataCenter()}>
+                  <Button variant="outline" onClick={() => addDemoDataCenter()}>
                     <MapPin className="mr-2 h-4 w-4" />
-                    Add mock site
+                    Add demo site
                   </Button>
                 </div>
               </div>
@@ -2186,6 +2493,13 @@ export default function App() {
                 </div>
               </CardContent>
             </Card>
+
+            <AgentConversationPanel
+              bayesEvents={bayesEvents}
+              agentHistory={agentHistory}
+              centers={centers}
+              isRunning={isRunning}
+            />
           </main>
 
           <aside>
