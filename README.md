@@ -38,7 +38,7 @@ Ensure that sample data is added to the input directory (data is available in `i
 * ML_code: example code (Gemma fine-tuning).
 * DC_specs: PDF files containing data center building specifications, including a table of heat capacities per material.
 
-Open the Kaggle notebook `Kaggle/Gemma4Hackathon.ipynb`. This notebook loads Gemma 4 with Unsloth. Click **Run All** to execute the workflow using the default sample data. The notebook will output:
+Open the Kaggle notebook `Gemma4Hackathon.ipynb`. This notebook loads Gemma 4 with Unsloth. Click **Run All** to execute the workflow using the default sample data. The notebook will output:
 
 1. Parsed and organized data center specifications.
 2. Estimated power load for the provided sample code.
