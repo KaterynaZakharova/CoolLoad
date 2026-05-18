@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "builds": [
+    {
+      "src": "simulation_api_server.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "simulation_api_server.py"
+    }
+  ]
+}
