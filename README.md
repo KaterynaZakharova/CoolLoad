@@ -34,22 +34,25 @@ Model outputs dynamic heatmap distributions - a thermodynamic simulation mapping
 
 ## How To Run
 ### Quick Run On Kaggle (Test Gemma 4)
-Ensure that sample data is added to the input directory (data is available in `input_data_sample/`):
+Ensure that sample data is added to the input directory (data is available in `input_data_sample/` also public on Kaggle):
 * ML_code: example code (Gemma fine-tuning).
 * DC_specs: PDF files containing data center building specifications, including a table of heat capacities per material.
 
-Open the Kaggle notebook `Gemma4Hackathon.ipynb`. This notebook loads Gemma 4 with Unsloth. Click **Run All** to execute the workflow using the default sample data. The notebook will output:
+Open the Kaggle notebook `Kaggle/Gemma4Hackathon.ipynb`. This notebook loads Gemma 4 with Unsloth. Click **Run All** to execute the workflow using the default sample data. The notebook will output:
 
 1. Parsed and organized data center specifications.
 2. Estimated power load for the provided sample code.
+3. Example of local agent verdicts – indicating whether a workload is accepted or rejected, along with reasoning that is communicated back to the orchestrator.
 ### Full Project Run
 _Install python dependencies._
+```
+pip install -r requirements.txt
+```
 #### Start Simulation Server
 Add the following to your `.env` file:
 ```
-GOOGLE_STUDIO_AI_API_KEY = 'xxx'
-LOCAL_AGENT_MODEL = 'gemma-4-31b-it'
-USE_AGENT_LLM_DEFAULT = true
+GOOGLE_STUDIO_AI_API_KEY=xxx
+LOCAL_AGENT_MODEL=gemma-4-31b-it
 ```
 The command below will use Gemma 4 via the Google API (for a simplified deployement):
 ```
@@ -60,6 +63,6 @@ uvicorn simulation_api_server:app --host 127.0.0.1 --port 8765
 ```
 cd frontend/dc-heat-dashboard
 npm install
-npm install lucide-react
 npm run dev
 ```
+Access the website: `http://localhost:5173/`
