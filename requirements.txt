@@ -112,7 +112,7 @@ comm @ file:///C:/ci_311/comm_1678376562840/work
 compressed-tensors==0.8.1
 conda @ file:///C:/b/abs_3eb7ewgq2c/croot/conda_1694545461647/work
 conda-build @ file:///C:/b/abs_8di4gx5nj5/croot/conda-build_1692366837286/work
-[2026-05-18 5:20 PM] Лапотище 🐾🐥: conda-content-trust @ file:///C:/b/abs_e3bcpyv7sw/croot/conda-content-trust_1693490654398/work
+conda-content-trust @ file:///C:/b/abs_e3bcpyv7sw/croot/conda-content-trust_1693490654398/work
 conda-libmamba-solver @ file:///C:/b/abs_016p0csqp7/croot/conda-libmamba-solver_1691418958509/work/src
 conda-pack @ file:///tmp/build/80754af9/conda-pack_1611163042455/work
 conda-package-handling @ file:///C:/b/abs_b9wp3lr1gn/croot/conda-package-handling_1691008700066/work
@@ -241,7 +241,7 @@ hyperframe==6.1.0
 hyperlink @ file:///tmp/build/80754af9/hyperlink_1610130746837/work
 idna==3.11
 ifaddr==0.2.0
-[2026-05-18 5:20 PM] Лапотище 🐾🐥: imagecodecs @ file:///C:/b/abs_e2g5zbs1q0/croot/imagecodecs_1695065012000/work
+imagecodecs @ file:///C:/b/abs_e2g5zbs1q0/croot/imagecodecs_1695065012000/work
 ImageIO==2.37.2
 imageio-ffmpeg==0.5.1
 imagesize @ file:///C:/ci_311/imagesize_1676431905616/work
@@ -332,7 +332,7 @@ Markdown @ file:///C:/ci_311/markdown_1676437912393/work
 markdown-it-py==4.0.0
 MarkupSafe @ file:///C:/ci_311/markupsafe_1676424152318/work
 marshmallow==3.22.0
-[2026-05-18 5:20 PM] Лапотище 🐾🐥: matplotlib==3.10.8
+matplotlib==3.10.8
 matplotlib-inline @ file:///C:/ci_311/matplotlib-inline_1676425798036/work
 mccabe @ file:///opt/conda/conda-bld/mccabe_1644221741721/work
 mdit-py-plugins @ file:///C:/ci_311/mdit-py-plugins_1676481827414/work
@@ -452,7 +452,7 @@ polars-runtime-32==1.35.1
 pooch==1.8.2
 portalocker==3.1.1
 posthog==3.7.0
-[2026-05-18 5:20 PM] Лапотище 🐾🐥: poyo @ file:///tmp/build/80754af9/poyo_1617751526755/work
+poyo @ file:///tmp/build/80754af9/poyo_1617751526755/work
 prettytable==3.17.0
 priority==2.0.0
 proglog==0.1.10
@@ -580,7 +580,7 @@ requests==2.32.5
 requests-file @ file:///Users/ktietz/demo/mc3/conda-bld/requests-file_1629455781986/work
 requests-oauthlib==2.0.0
 requests-toolbelt==1.0.0
-[2026-05-18 5:20 PM] Лапотище 🐾🐥: responses @ file:///tmp/build/80754af9/responses_1619800270522/work
+responses @ file:///tmp/build/80754af9/responses_1619800270522/work
 retina-face==0.0.17
 rf-clip==1.0
 rfc3339-validator @ file:///C:/b/abs_ddfmseb_vm/croot/rfc3339-validator_1683077054906/work
@@ -681,7 +681,7 @@ tldextract==5.1.3
 tokenizers==0.19.1
 toml @ file:///tmp/build/80754af9/toml_1616166611790/work
 tomlkit==0.13.3
-[2026-05-18 5:20 PM] Лапотище 🐾🐥: toolz @ file:///C:/ci_311/toolz_1676431406517/work
+toolz @ file:///C:/ci_311/toolz_1676431406517/work
 torch==2.5.1+cu121
 torchvision==0.20.1+cu121
 tornado==6.5.5
