@@ -1,0 +1,20 @@
+fastapi==0.136.1
+fiona==1.10.1
+geopandas==1.1.3
+geopy==2.4.1
+google==3.0.0
+google-auth==2.53.0
+google-genai==2.4.0
+httpx==0.28.1
+matplotlib==3.10.9
+numpy==2.2.6
+osmnx @ https://files.pythonhosted.org/packages/0e/a7/8606797abfd9a47cd11f26ca7d70b818d9e2f5346811d797efb3429b7603/osmnx-2.0.7-py3-none-any.whl
+pandas==2.3.3
+PyMuPDF==1.27.2.3
+python-dotenv==1.2.2
+rasterio==1.4.4
+scikit-learn==1.7.2
+scipy==1.15.3
+shapely==2.1.2
+tqdm==4.67.3
+uvicorn==0.47.0
